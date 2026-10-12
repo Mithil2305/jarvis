@@ -1,0 +1,78 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Native extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+.eggs/
+*.egg-info/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test, lint, and type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Editor / IDE
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs and runtime artifacts
+logs/
+*.log
+*.tmp
+
+# Audio artifacts generated during testing/debugging
+*.wav
+*.mp3
+*.flac
+
+# Large local model files
+models/**/*.gguf
+
+# Local data caches
+data/tmp/
+data/cache/
+
+# llama.cpp local build outputs
+llama.cpp/build/
+llama.cpp/bin/
+llama.cpp/out/
+llama.cpp/*.exe
+llama.cpp/*.dll
+llama.cpp/*.lib
+llama.cpp/*.obj
+llama.cpp/*.pdb
