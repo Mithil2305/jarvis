@@ -1,405 +1,231 @@
+"""Jarvis voice assistant: microphone -> local STT -> local Gemma -> local TTS."""
+from __future__ import annotations
+
 import os
 import queue
 import re
-import tempfile
 import time
 from collections import deque
 
 import numpy as np
 import requests
 import sounddevice as sd
-import soundfile as sf
-import pyttsx3
-import torch
-from faster_whisper import WhisperModel
-from parler_tts import ParlerTTSForConditionalGeneration
-from transformers import AutoTokenizer
+
+from jarvis_speech import backend_status, speak, transcribe_audio
+from jarvis_actions import handle_command, PendingAction
 
 
 # ---------------- CONFIGURATION ----------------
-
-LLM_URL = "http://127.0.0.1:8080/v1/chat/completions"
-
-MIC_DEVICE = 1
-SAMPLE_RATE = 16000
-
+LLM_URL = os.environ.get("JARVIS_LLM_URL", "http://127.0.0.1:8080/v1/chat/completions")
+SAMPLE_RATE = int(os.environ.get("JARVIS_SAMPLE_RATE", "16000"))
 FRAME_MS = 30
 FRAME_SIZE = int(SAMPLE_RATE * FRAME_MS / 1000)
+CALIBRATION_SECONDS = float(os.environ.get("JARVIS_CALIBRATION_SECONDS", "1.0"))
+SILENCE_SECONDS = float(os.environ.get("JARVIS_SILENCE_SECONDS", "1.15"))
+MAX_SPEECH_SECONDS = float(os.environ.get("JARVIS_MAX_SPEECH_SECONDS", "20"))
+MIN_SPEECH_SECONDS = float(os.environ.get("JARVIS_MIN_SPEECH_SECONDS", "0.35"))
+PREROLL_FRAMES = 15
 
-CALIBRATION_SECONDS = 1.2
-SILENCE_SECONDS = 1.0
-MAX_SPEECH_SECONDS = 15
-MIN_SPEECH_SECONDS = 0.25
-PREROLL_FRAMES = 10
-
-PARLER_MODEL_ID = "ai4bharat/indic-parler-tts"
-MAX_TTS_CHUNK_CHARS = 220
+MIC_DEVICE_RAW = os.environ.get("JARVIS_MIC_DEVICE", "").strip().lower()
+if MIC_DEVICE_RAW in {"", "default", "auto", "none"}:
+    MIC_DEVICE = None
+else:
+    try:
+        MIC_DEVICE = int(MIC_DEVICE_RAW)
+    except ValueError:
+        MIC_DEVICE = MIC_DEVICE_RAW
 
 SYSTEM_PROMPT = """
-You are Jarvis, a helpful personal desktop assistant.
-Speak naturally and keep answers concise.
+You are Jarvis, a helpful personal desktop voice assistant running on Windows.
+You CAN execute real desktop actions: open/close apps, control volume, take screenshots,
+open websites, control media playback, lock the screen, and more.
+For commands you can execute, do so — your action layer handles them automatically.
+For everything else, answer in natural spoken English, normally in one to three concise sentences.
+Use plain text without Markdown, tables, bullet lists, code fences, or LaTeX unless
+the user specifically asks for a written or technical format.
 Remember the recent conversation.
-Never claim to perform actions you cannot actually execute.
-"""
+""".strip()
+
+messages: list[dict[str, str]] = []
 
 
-# ---------------- INITIALIZE MODELS ----------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Confirmation helper
+# ─────────────────────────────────────────────────────────────────────────────
 
-print("Loading local Whisper model...", flush=True)
-
-whisper = WhisperModel(
-    "base.en",
-    device="cpu",
-    compute_type="int8",
-)
-
-# Parler is loaded lazily the first time speak() is called. This avoids
-# holding its memory while Jarvis starts and listens.
-parler_model = None
-parler_tokenizer = None
-description_tokenizer = None
-parler_sample_rate = None
-parler_disabled = False
-
-# Keep a single Windows SAPI5 engine as a fallback.
-fallback_tts = pyttsx3.init("sapi5")
-fallback_tts.setProperty("rate", 175)
-fallback_tts.setProperty("volume", 1.0)
-
-messages = []
-
-VOICE_DESCRIPTION = (
-    "A natural, conversational Indian English speaker speaks clearly "
-    "at a moderate pace with a warm, friendly tone. The audio is clear "
-    "and close, with no background noise."
-)
+_AFFIRMATIVE = {
+    "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "go",
+    "do it", "proceed", "confirm", "confirmed", "correct", "right",
+    "affirmative", "definitely", "absolutely", "please", "fine",
+}
 
 
-# ---------------- INDIC PARLER TEXT TO SPEECH ----------------
-
-def load_parler():
-    """Load the local Indic Parler-TTS model once, on CPU."""
-    global parler_model, parler_tokenizer
-    global description_tokenizer, parler_sample_rate, parler_disabled
-
-    if parler_model is not None:
-        return
-    if parler_disabled:
-        raise RuntimeError("Indic Parler-TTS was disabled after an earlier error.")
-
-    print("Loading Indic Parler-TTS on CPU. First load may take a while...", flush=True)
-    try:
-        model = ParlerTTSForConditionalGeneration.from_pretrained(
-            PARLER_MODEL_ID
-        ).to("cpu")
-        model.eval()
-
-        tokenizer = AutoTokenizer.from_pretrained(PARLER_MODEL_ID)
-        desc_tokenizer = AutoTokenizer.from_pretrained(
-            model.config.text_encoder._name_or_path
-        )
-
-        parler_model = model
-        parler_tokenizer = tokenizer
-        description_tokenizer = desc_tokenizer
-        parler_sample_rate = model.config.sampling_rate
-        print(
-            f"Indic Parler-TTS ready (sample rate: {parler_sample_rate} Hz).",
-            flush=True,
-        )
-    except Exception:
-        parler_disabled = True
-        raise
+def _is_affirmative(text: str) -> bool:
+    """Return True when the user's reply is a clear yes/confirmation."""
+    # Strip all punctuation and check for any affirmative word.
+    clean = re.sub(r"[^\w\s]", "", text.lower()).strip()
+    return bool(set(clean.split()) & _AFFIRMATIVE)
 
 
-def split_text_for_speech(text, max_chars=MAX_TTS_CHUNK_CHARS):
-    """Split text into sentence-aware chunks that are small enough for CPU TTS."""
-    text = re.sub(r"\s+", " ", str(text)).strip()
-    if not text:
-        return []
-
-    sentences = re.split(r"(?<=[.!?।])\s+", text)
-    chunks = []
-    current = ""
-
-    for sentence in sentences:
-        sentence = sentence.strip()
-        if not sentence:
-            continue
-
-        # Break exceptionally long sentences at word boundaries.
-        pieces = []
-        while len(sentence) > max_chars:
-            cut = sentence.rfind(" ", 0, max_chars + 1)
-            if cut <= 0:
-                cut = max_chars
-            pieces.append(sentence[:cut].strip())
-            sentence = sentence[cut:].strip()
-        if sentence:
-            pieces.append(sentence)
-
-        for piece in pieces:
-            candidate = f"{current} {piece}".strip()
-            if current and len(candidate) > max_chars:
-                chunks.append(current)
-                current = piece
-            else:
-                current = candidate
-
-    if current:
-        chunks.append(current)
-    return chunks
-
-
-def generate_parler_audio(text):
-    """Generate one audio chunk using the tested Indic Parler-TTS API."""
-    load_parler()
-
-    description_inputs = description_tokenizer(
-        VOICE_DESCRIPTION,
-        return_tensors="pt",
-    )
-    text_inputs = parler_tokenizer(
-        text,
-        return_tensors="pt",
-    )
-
-    with torch.inference_mode():
-        output = parler_model.generate(
-            input_ids=description_inputs.input_ids,
-            attention_mask=description_inputs.attention_mask,
-            prompt_input_ids=text_inputs.input_ids,
-            prompt_attention_mask=text_inputs.attention_mask,
-        )
-
-    audio = output.detach().cpu().numpy().squeeze()
-    if audio.size == 0:
-        raise RuntimeError("Indic Parler-TTS generated empty audio.")
-    if not np.isfinite(audio).all():
-        raise RuntimeError("Indic Parler-TTS generated invalid audio values.")
-    return audio
-
-
-def speak_with_fallback(text):
-    """Speak using Windows SAPI5 if Parler is unavailable."""
-    print("Using Windows SAPI5 fallback.", flush=True)
-    fallback_tts.say(text)
-    fallback_tts.runAndWait()
-
-
-def speak(text):
-    global parler_disabled
-    text = str(text).strip()
-    if not text:
-        print("TTS: No text received.", flush=True)
-        return
-
-    print(f"JARVIS SPEAKING: {text}", flush=True)
-
-    chunks = split_text_for_speech(text)
-    for chunk in chunks:
-        if parler_disabled:
-            speak_with_fallback(chunk)
-            continue
-
-        try:
-            print(f"Generating speech ({len(chunk)} characters)...", flush=True)
-            audio = generate_parler_audio(chunk)
-            print("Playing speech...", flush=True)
-            sd.play(audio, samplerate=parler_sample_rate, blocking=True)
-        except Exception as exc:
-            print(
-                f"Indic Parler-TTS error: {type(exc).__name__}: {exc}",
-                flush=True,
-            )
-            # If loading/generation/playback fails, switch to fallback for
-            # this and subsequent chunks instead of retrying the model forever.
-            parler_disabled = True
-            try:
-                sd.stop()
-            except Exception:
-                pass
-            speak_with_fallback(chunk)
-
-
-# ---------------- AUDIO UTILITIES ----------------
-
-def rms(frame):
-    """Calculate the volume of a microphone audio frame."""
+def rms(frame) -> float:
+    """Return root-mean-square energy for one microphone frame."""
     return float(np.sqrt(np.mean(np.square(frame))))
 
 
-def record_until_silence():
-    """
-    Listen continuously until speech is detected.
-    Stop after sufficient silence or the maximum duration.
-    """
-    audio_queue = queue.Queue(maxsize=200)
+def _record_from_device(device):
+    """Record one utterance using adaptive, hysteresis-based energy detection."""
+    audio_queue: queue.Queue = queue.Queue(maxsize=250)
     pre_roll = deque(maxlen=PREROLL_FRAMES)
 
     def audio_callback(indata, frames, time_info, status):
-        if status:
-            print(f"Audio status: {status}", flush=True)
+        if status and ("overflow" in str(status).lower() or "underflow" in str(status).lower()):
+            print(f"Microphone status: {status}", flush=True)
         try:
             audio_queue.put_nowait(indata[:, 0].copy())
         except queue.Full:
-            # Never block PortAudio's callback thread.
+            # Never block the real-time PortAudio callback.
             pass
 
     print("\nCalibrating microphone noise level...", flush=True)
-
     with sd.InputStream(
-        device=MIC_DEVICE,
+        device=device,
         samplerate=SAMPLE_RATE,
         channels=1,
         dtype="float32",
         blocksize=FRAME_SIZE,
+        latency="high",
         callback=audio_callback,
     ):
         calibration_levels = []
-
-        for _ in range(int(CALIBRATION_SECONDS * 1000 / FRAME_MS)):
-            frame = audio_queue.get(timeout=3)
-            calibration_levels.append(rms(frame))
+        for _ in range(max(1, int(CALIBRATION_SECONDS * 1000 / FRAME_MS))):
+            calibration_levels.append(rms(audio_queue.get(timeout=5)))
 
         noise_level = float(np.median(calibration_levels))
-        threshold = max(noise_level * 2.9, 0.005)
+        # Distinct start/stop thresholds prevent brief noise from starting a
+        # recording while preserving softer syllables after speech begins.
+        start_threshold = min(max(noise_level * 2.7, 0.0055), 0.014)
+        stop_threshold = max(noise_level * 1.45, 0.0035)
+        stop_threshold = min(stop_threshold, start_threshold * 0.75)
+
+        # Discard frames from the calibration interval before waiting for speech.
+        while True:
+            try:
+                audio_queue.get_nowait()
+            except queue.Empty:
+                break
 
         print(
-            f"Noise level: {noise_level:.4f} | "
-            f"Speech threshold: {threshold:.4f}",
+            f"Noise RMS: {noise_level:.4f} | start: {start_threshold:.4f} | "
+            f"stop: {stop_threshold:.4f}",
             flush=True,
         )
         print("Listening... Speak naturally.", flush=True)
 
         speech_started = False
-        consecutive_loud_frames = 0
+        loud_run = 0
         silent_frames = 0
         speech_frames = []
-
-        silence_limit = int(SILENCE_SECONDS * 1000 / FRAME_MS)
-        max_frames = int(MAX_SPEECH_SECONDS * 1000 / FRAME_MS)
+        start_confirm_frames = max(3, int(120 / FRAME_MS))
+        silence_limit = max(1, int(SILENCE_SECONDS * 1000 / FRAME_MS))
+        max_frames = max(1, int(MAX_SPEECH_SECONDS * 1000 / FRAME_MS))
 
         while True:
-            frame = audio_queue.get(timeout=10)
+            frame = audio_queue.get(timeout=15)
             level = rms(frame)
             pre_roll.append(frame)
 
             if not speech_started:
-                if level > threshold:
-                    consecutive_loud_frames += 1
-                else:
-                    consecutive_loud_frames = 0
-
-                if consecutive_loud_frames >= 2:
+                loud_run = loud_run + 1 if level >= start_threshold else 0
+                if loud_run >= start_confirm_frames:
                     speech_started = True
                     speech_frames = list(pre_roll)
                     print("Speech detected.", flush=True)
                 continue
 
             speech_frames.append(frame)
-
-            if level < threshold:
-                silent_frames += 1
-            else:
-                silent_frames = 0
+            silent_frames = silent_frames + 1 if level < stop_threshold else 0
 
             if silent_frames >= silence_limit:
                 break
-
             if len(speech_frames) >= max_frames:
                 print("Maximum recording duration reached.", flush=True)
                 break
 
-        duration = len(speech_frames) * FRAME_MS / 1000
-        if duration < MIN_SPEECH_SECONDS:
-            print("Recording too short. Try again.", flush=True)
+        if not speech_frames:
             return None
 
-        print(f"Captured {duration:.1f} seconds of audio.", flush=True)
-        return np.concatenate(speech_frames)
+        audio = np.concatenate(speech_frames).astype(np.float32, copy=False)
+        duration = len(audio) / SAMPLE_RATE
+        levels = [rms(frame) for frame in speech_frames]
+        active_duration = sum(level >= stop_threshold for level in levels) * FRAME_MS / 1000.0
+        rms_level = float(np.sqrt(np.mean(np.square(audio))))
+        peak_level = float(np.max(np.abs(audio)))
 
-
-# ---------------- SPEECH TO TEXT ----------------
-
-def transcribe(audio):
-    path = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as file:
-            path = file.name
-
-        sf.write(path, audio, SAMPLE_RATE)
-
-        segments, info = whisper.transcribe(
-            path,
-            language="en",
-            beam_size=5,
-            best_of=5,
-            vad_filter=False,
-            condition_on_previous_text=False,
-            initial_prompt=(
-                "Jarvis, programming, recursion, equations, Python, "
-                "computer science."
-            ),
+        print(
+            f"Captured {duration:.1f}s | active: {active_duration:.1f}s | "
+            f"RMS: {rms_level:.4f} | peak: {peak_level:.4f}",
+            flush=True,
         )
-
-        transcript = " ".join(
-            segment.text.strip() for segment in segments
-        ).strip()
-        return transcript
-    finally:
-        if path and os.path.exists(path):
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+        if duration < MIN_SPEECH_SECONDS or active_duration < 0.22:
+            print("Ignoring a short/noisy clip. Please try again.", flush=True)
+            return None
+        if rms_level < 0.0018 or peak_level < 0.008:
+            print("Ignoring a near-silent clip.", flush=True)
+            return None
+        return audio
 
 
-# ---------------- GEMMA CHAT ----------------
+def record_until_silence():
+    """Use the configured mic; retry the Windows default input if index fails."""
+    try:
+        return _record_from_device(MIC_DEVICE)
+    except sd.PortAudioError as exc:
+        if MIC_DEVICE is not None:
+            print(
+                f"Microphone {MIC_DEVICE!r} could not be opened ({exc}). "
+                "Retrying the Windows default input device.",
+                flush=True,
+            )
+            return _record_from_device(None)
+        raise
 
-def ask_gemma(text):
-    messages.append({"role": "user", "content": text})
 
+def ask_gemma(text: str) -> str:
+    """Send the conversation to the existing local llama.cpp endpoint."""
+    recent = [*messages, {"role": "user", "content": text}][-10:]
     payload = {
-        "model": "gemma-4",
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            *messages[-10:],
-        ],
+        "model": os.environ.get("JARVIS_MODEL_NAME", "gemma-4"),
+        "messages": [{"role": "system", "content": SYSTEM_PROMPT}, *recent],
         "temperature": 0.4,
-        "max_tokens": 200,
+        "max_tokens": int(os.environ.get("JARVIS_MAX_TOKENS", "160")),
         "stream": False,
     }
-
-    response = requests.post(
-        LLM_URL,
-        json=payload,
-        timeout=180,
-    )
+    response = requests.post(LLM_URL, json=payload, timeout=180)
     response.raise_for_status()
 
-    answer = (
-        response.json()["choices"][0]["message"]["content"] or ""
-    ).strip()
-
+    try:
+        answer = (response.json()["choices"][0]["message"]["content"] or "").strip()
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError("The local LLM returned an unexpected response format.") from exc
     if not answer:
-        messages.pop()
-        raise RuntimeError("Gemma returned an empty response.")
+        raise RuntimeError("The local Gemma model returned an empty response.")
 
-    messages.append({"role": "assistant", "content": answer})
+    # Commit the turn only after a valid answer is received, preventing a failed
+    # HTTP request from leaving unmatched user messages in the history.
+    messages.extend(({"role": "user", "content": text}, {"role": "assistant", "content": answer}))
+    del messages[:-20]
     return answer
 
 
-# ---------------- MAIN LOOP ----------------
-
 def main():
-    speak("Jarvis is online. I am listening.")
+    print("Jarvis — local voice pipeline", flush=True)
+    print(backend_status(), flush=True)
+    print(f"LLM endpoint: {LLM_URL}", flush=True)
+    if not LLM_URL.startswith(("http://127.0.0.1", "http://localhost", "http://[::1]")):
+        print("WARNING: the configured LLM endpoint is not loopback/local.", flush=True)
 
-    print(
-        "\nSpeak whenever you are ready. "
-        "Say 'stop jarvis' to exit.",
-        flush=True,
-    )
+    speak("Jarvis is online. I am listening.")
+    print("Speak when ready. Say 'stop Jarvis' to exit. Press Ctrl+C to quit.", flush=True)
 
     while True:
         try:
@@ -407,42 +233,64 @@ def main():
             if audio is None:
                 continue
 
-            print("Transcribing...", flush=True)
-            text = transcribe(audio)
-
+            print("Transcribing with local Faster-Whisper...", flush=True)
+            text = transcribe_audio(audio, SAMPLE_RATE)
             if not text:
-                print("No speech recognized.", flush=True)
                 continue
-
             print(f"\nYOU: {text}", flush=True)
 
-            if text.lower().strip() in {
-                "exit",
-                "quit",
-                "stop jarvis",
-                "shutdown jarvis",
+            # Strip all trailing/leading punctuation so "stop Jarvis," and
+            # "stop Jarvis?" are caught along with the plain form.
+            normalized = re.sub(r"[^\w\s]", "", text).lower().strip()
+            if normalized in {
+                "exit", "quit", "stop jarvis", "shutdown jarvis", "goodbye jarvis",
             }:
                 speak("Goodbye.")
                 break
 
-            print("Thinking...", flush=True)
+            # ── Command intercept ──────────────────────────────────────────
+            # Try to execute as a desktop action first.  Only fall through to
+            # the LLM when no action pattern matches.
+            action_result = handle_command(text)
+
+            if isinstance(action_result, PendingAction):
+                # Destructive command — ask for verbal confirmation.
+                speak(action_result.confirmation_prompt)
+                print("[confirm] Waiting for yes/no...", flush=True)
+                try:
+                    confirm_audio = record_until_silence()
+                    if confirm_audio is not None:
+                        confirm_text = transcribe_audio(confirm_audio, SAMPLE_RATE)
+                        print(f"[confirm] Heard: {confirm_text!r}", flush=True)
+                        if _is_affirmative(confirm_text):
+                            final = action_result.execute()
+                            speak(final)
+                        else:
+                            speak("Okay, action cancelled.")
+                    else:
+                        speak("No response received. Action cancelled.")
+                except Exception as confirm_exc:
+                    print(f"[confirm] Error during confirmation: {confirm_exc}", flush=True)
+                    speak("I could not hear your confirmation. Action cancelled.")
+                continue
+
+            if action_result is not None:
+                speak(action_result)
+                continue
+
+            print("Thinking with local Gemma...", flush=True)
             answer = ask_gemma(text)
             speak(answer)
 
         except KeyboardInterrupt:
             print("\nJarvis stopped.", flush=True)
             break
-
         except queue.Empty:
-            print(
-                "No microphone audio received. Check the microphone device.",
-                flush=True,
-            )
-
+            print("No microphone audio received. Check the input device/permissions.", flush=True)
         except requests.RequestException as exc:
-            print(f"LLM connection error: {exc}", flush=True)
+            print(f"Local LLM connection error: {exc}", flush=True)
+            print("Confirm llama-server is running at the configured endpoint.", flush=True)
             time.sleep(1)
-
         except Exception as exc:
             print(f"Error: {type(exc).__name__}: {exc}", flush=True)
             time.sleep(0.5)

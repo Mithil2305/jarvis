@@ -1,0 +1,19 @@
+# Minimal dependencies for the current local Jarvis voice assistant.
+# Install with the Python executable in the project's existing .venv.
+numpy>=1.24,<3
+requests>=2.31
+sounddevice>=0.5
+soundfile>=0.12
+faster-whisper>=1.1,<2
+# PyAV releases in the v17+ line have caused compatibility issues with
+# Faster-Whisper in some environments; keep this install on a known range.
+av>=11,<17
+# Faster-Whisper VAD uses ONNX Runtime. Python 3.10 needs the pre-1.24 line.
+onnxruntime<1.24; python_version < "3.11"
+pyttsx3>=2.90
+kokoro>=0.9.4,<1
+misaki[en]>=0.7
+# Desktop action control (volume, screenshots, media keys, keyboard)
+pycaw>=0.5.1
+comtypes>=1.4
+pyautogui>=0.9.54
