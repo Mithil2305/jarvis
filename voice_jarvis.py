@@ -12,8 +12,16 @@ import numpy as np
 import requests
 import sounddevice as sd
 
+import threading
+from typing import Optional
+
 from jarvis_speech import backend_status, speak, transcribe_audio
 from jarvis_actions import handle_command, handle_structured_command, PendingAction
+from jarvis_indicator import JarvisIndicator, get_indicator, set_global_indicator
+
+_SHUTDOWN_EVENT = threading.Event()
+_INDICATOR: Optional[JarvisIndicator] = None
+
 
 
 # ---------------- CONFIGURATION ----------------
@@ -154,6 +162,9 @@ def calibrate_device(device, seconds: float = CALIBRATION_SECONDS) -> tuple[floa
 
 def _record_from_device(device):
     """Record one utterance using cached calibration and adaptive energy detection."""
+    if _SHUTDOWN_EVENT.is_set():
+        return None
+
     key = str(device)
     if key not in _CALIBRATED_THRESHOLDS:
         noise_level, start_threshold, stop_threshold = calibrate_device(device)
@@ -198,8 +209,12 @@ def _record_from_device(device):
         silence_limit = max(1, int(SILENCE_SECONDS * 1000 / FRAME_MS))
         max_frames = max(1, int(MAX_SPEECH_SECONDS * 1000 / FRAME_MS))
 
-        while True:
-            frame = audio_queue.get(timeout=15)
+        while not _SHUTDOWN_EVENT.is_set():
+            try:
+                frame = audio_queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+
             level = rms(frame)
             pre_roll.append(frame)
 
@@ -217,6 +232,8 @@ def _record_from_device(device):
                     speech_started = True
                     speech_frames = list(pre_roll)
                     print("Speech detected.", flush=True)
+                    if _INDICATOR:
+                        _INDICATOR.set_state("hearing", "Speech detected...")
                 continue
 
             speech_frames.append(frame)
@@ -228,7 +245,7 @@ def _record_from_device(device):
                 print("Maximum recording duration reached.", flush=True)
                 break
 
-        if not speech_frames:
+        if not speech_frames or _SHUTDOWN_EVENT.is_set():
             return None
 
         audio = np.concatenate(speech_frames).astype(np.float32, copy=False)
@@ -374,12 +391,15 @@ def _complete_action(action_result: str | PendingAction) -> str:
         return "I could not hear your confirmation. Action cancelled."
 
 
-def main():
+def _voice_assistant_loop(indicator: Optional[JarvisIndicator] = None) -> None:
     print("Jarvis — local voice pipeline (real-time mode)", flush=True)
     print(backend_status(), flush=True)
     print(f"LLM endpoint: {LLM_URL}", flush=True)
     if not LLM_URL.startswith(("http://127.0.0.1", "http://localhost", "http://[::1]")):
         print("WARNING: the configured LLM endpoint is not loopback/local.", flush=True)
+
+    if indicator:
+        indicator.set_state("starting", "Warming up models...")
 
     print("Warming up local speech models...", flush=True)
     from jarvis_speech import _get_stt_model
@@ -392,11 +412,19 @@ def main():
     speak("Jarvis is online. I am listening.")
     print("Speak when ready. Say 'stop Jarvis' to exit. Press Ctrl+C to quit.", flush=True)
 
-    while True:
+    while not _SHUTDOWN_EVENT.is_set():
         try:
+            if indicator:
+                indicator.set_state("listening", "Listening... Speak naturally")
+
             audio = record_until_silence()
+            if _SHUTDOWN_EVENT.is_set():
+                break
             if audio is None:
                 continue
+
+            if indicator:
+                indicator.set_state("transcribing", "Transcribing speech...")
 
             print("Transcribing with local Faster-Whisper...", flush=True)
             text = transcribe_audio(audio, SAMPLE_RATE)
@@ -404,36 +432,42 @@ def main():
                 continue
             print(f"\nYOU: {text}", flush=True)
 
-            # Strip all trailing/leading punctuation so "stop Jarvis," and
-            # "stop Jarvis?" are caught along with the plain form.
             normalized = re.sub(r"[^\w\s]", "", text).lower().strip()
             if normalized in {
                 "exit", "quit", "stop jarvis", "shutdown jarvis", "goodbye jarvis",
             }:
+                if indicator:
+                    indicator.set_state("stopping", "Shutting down...")
                 speak("Goodbye.")
+                _SHUTDOWN_EVENT.set()
+                if indicator:
+                    indicator.request_shutdown()
                 break
 
-            # ── Direct command intercept ────────────────────────────────────
-            # Keep deterministic command matches local. The LLM router is a
-            # fallback for varied phrasing and returns a typed action schema.
-            # Direct action regexes intentionally support short commands, so a
-            # discussion such as "What does mute mean?" or a negation such as
-            # "Don't mute" must go through the intent router instead.
             action_result = (
                 None
                 if _DISCUSSION_OR_NEGATION.search(text)
                 else handle_command(text)
             )
             if action_result is not None:
+                if indicator:
+                    indicator.set_state("executing", "Executing command...")
                 answer = _complete_action(action_result)
+                if indicator:
+                    indicator.set_state("speaking", "Speaking response...")
                 speak(answer)
                 _remember_turn(text, answer)
                 continue
 
+            if indicator:
+                indicator.set_state("thinking", "Interpreting...")
             print("Interpreting with local Gemma...", flush=True)
             route = ask_gemma(text)
             route_type = route.get("type")
             if route_type == "action":
+                intent_name = str(route.get("intent", "action"))
+                if indicator:
+                    indicator.set_state("executing", f"Executing {intent_name}...")
                 print(
                     f"[router] Intent: {route.get('intent')} | "
                     f"confidence: {route.get('confidence')}",
@@ -446,6 +480,8 @@ def main():
                     answer = _complete_action(action_result)
             else:
                 answer = str(route.get("text", "Could you rephrase that request?"))
+            if indicator:
+                indicator.set_state("speaking", "Speaking response...")
             speak(answer)
             _remember_turn(text, answer)
 
@@ -461,6 +497,35 @@ def main():
         except Exception as exc:
             print(f"Error: {type(exc).__name__}: {exc}", flush=True)
             time.sleep(0.5)
+
+    if indicator:
+        indicator.close()
+
+
+def main():
+    global _INDICATOR
+    if os.environ.get("JARVIS_NO_GUI", "false").lower() in {"1", "true", "yes"}:
+        _voice_assistant_loop(None)
+        return
+
+    def on_gui_shutdown():
+        _SHUTDOWN_EVENT.set()
+
+    _INDICATOR = JarvisIndicator(on_shutdown=on_gui_shutdown)
+    set_global_indicator(_INDICATOR)
+
+    worker = threading.Thread(
+        target=_voice_assistant_loop,
+        args=(_INDICATOR,),
+        daemon=True,
+    )
+    worker.start()
+
+    try:
+        _INDICATOR.run_mainloop()
+    except KeyboardInterrupt:
+        _SHUTDOWN_EVENT.set()
+        _INDICATOR.request_shutdown()
 
 
 if __name__ == "__main__":

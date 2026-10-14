@@ -60,6 +60,23 @@ Set `JARVIS_WAKE_KEY` in `.env` to `F1`–`F24`, `PAUSE`, or `SCROLL_LOCK` to ch
 
 Remove the automatic start with `powershell -ExecutionPolicy Bypass -File .\install_jarvis_startup.ps1 -Remove`.
 
+## Desktop Visual Indicator & Shut Down Button
+
+When Jarvis is running, a floating desktop HUD appears on screen:
+
+- **Separate Jarvis Icon & Taskbar Identity**: A distinct cyan Arc Reactor icon appears in the HUD and on the Windows Taskbar as *Jarvis Voice Assistant*.
+- **Live State Indicator**:
+  - 🔵 **Cyan Pulse**: Jarvis is awake, active, and listening.
+  - 🟠 **Amber Waves**: Jarvis detected your voice and is recording speech.
+  - 🟣 **Violet Orbit**: Local Gemma / Whisper is processing your request.
+  - 🟢 **Emerald Wave**: Jarvis is executing a Windows action or speaking.
+  - 🔴 **Crimson Glow**: Jarvis is cleanly shutting down.
+- **Draggable Anywhere**: Click and drag anywhere on the widget to reposition it on your desktop.
+- **Always on Top**: Stays visible across open windows so you always know when Jarvis is listening.
+- **1-Click "⏻ Shut Down" Button**: A clear crimson button on the HUD immediately coordinates a clean shutdown of Jarvis and its supervised background services (`voice_jarvis`, `llama-server`, and `telegram_jarvis`).
+
+*(To run in headless / console-only mode without the visual HUD, set `$env:JARVIS_NO_GUI = "true"`).*
+
 ## Optional settings
 
 Defaults are chosen to suit the existing laptop setup. Set these in the same PowerShell window before launching Jarvis:
