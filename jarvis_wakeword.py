@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import threading
 import time
 from urllib.parse import urlsplit, urlunsplit
 
@@ -26,6 +27,7 @@ BLOCK_SAMPLES = 1_280  # openWakeWord's recommended 80 ms frame
 _MODEL_PROCESS: subprocess.Popen | None = None
 _VOICE_PROCESS: subprocess.Popen | None = None
 _TELEGRAM_PROCESS: subprocess.Popen | None = None
+_SHUTDOWN_REQUEST = LOG_DIR / "jarvis_shutdown.request"
 
 
 def _load_env_file() -> None:
@@ -48,17 +50,53 @@ def _load_env_file() -> None:
 
 def _configure_logging() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    handler = RotatingFileHandler(
-        LOG_DIR / "jarvis_wakeword.log",
-        maxBytes=1_000_000,
-        backupCount=3,
-        encoding="utf-8",
-    )
+    handlers: list[logging.Handler] = [
+        RotatingFileHandler(
+            LOG_DIR / "jarvis_wakeword.log",
+            maxBytes=1_000_000,
+            backupCount=3,
+            encoding="utf-8",
+        )
+    ]
+    if sys.stdout and hasattr(sys.stdout, "isatty") and sys.stdout.isatty():
+        handlers.append(logging.StreamHandler(sys.stdout))
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
-        handlers=[handler],
+        handlers=handlers,
     )
+
+
+def _play_chime(tones: list[tuple[int, int]]) -> None:
+    """Play a short audible tone sequence in the background for feedback."""
+    def _run() -> None:
+        try:
+            import winsound
+            for freq, dur in tones:
+                winsound.Beep(freq, dur)
+        except Exception:
+            pass
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _speak_async(text: str) -> None:
+    """Announce brief status updates using Windows SAPI without blocking."""
+    def _run() -> None:
+        try:
+            import pythoncom
+            import win32com.client
+
+            pythoncom.CoInitialize()
+            try:
+                voice = win32com.client.Dispatch("SAPI.SpVoice")
+                voice.Speak(text, 1)  # 1 = SVSFlagsAsync
+            finally:
+                pythoncom.CoUninitialize()
+        except Exception:
+            pass
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def _wake_key() -> tuple[str, int]:
@@ -143,19 +181,26 @@ def _microphone_device():
         return raw
 
 
-def _listen_for_wake_word(wake_model) -> bool:
+def _listen_for_wake_word(wake_model, vk_code: int | None = None) -> bool:
     try:
         import sounddevice as sd
     except ImportError as exc:
         raise RuntimeError("sounddevice is missing; reinstall requirements-voice.txt") from exc
 
     try:
-        timeout_seconds = max(1.0, float(os.environ.get("JARVIS_WAKE_TIMEOUT_SECONDS", "12")))
-        score_threshold = float(os.environ.get("JARVIS_WAKE_SCORE_THRESHOLD", "0.5"))
+        timeout_seconds = max(1.0, float(os.environ.get("JARVIS_WAKE_TIMEOUT_SECONDS", "18")))
+        score_threshold = float(os.environ.get("JARVIS_WAKE_SCORE_THRESHOLD", "0.25"))
     except ValueError as exc:
         raise ValueError("Wake timeout and score threshold must be numeric") from exc
     if not 0.0 < score_threshold <= 1.0:
         raise ValueError("JARVIS_WAKE_SCORE_THRESHOLD must be greater than 0 and at most 1")
+
+    # Reset wake model feature buffers from any prior listening session
+    if hasattr(wake_model, "reset"):
+        try:
+            wake_model.reset()
+        except Exception:
+            pass
 
     device = _microphone_device()
     stream_args = {
@@ -180,24 +225,51 @@ def _listen_for_wake_word(wake_model) -> bool:
         stream = sd.InputStream(device=None, **stream_args)
         stream.start()
 
+    # Audible cue indicating microphone is open and listening
+    _play_chime([(880, 80), (1320, 120)])
+
     logging.info("Microphone open for up to %.0f seconds; say 'Hey Jarvis'", timeout_seconds)
     deadline = time.monotonic() + timeout_seconds
+    peak_score = 0.0
+    peak_audio_rms = 0.0
     try:
         while time.monotonic() < deadline:
+            # Check if user double-pressed the hotkey to wake immediately without voice
+            if vk_code is not None and bool(ctypes.windll.user32.GetAsyncKeyState(vk_code) & 0x8000):
+                logging.info("Hotkey pressed again during listening window; manual wake triggered")
+                _play_chime([(1320, 80), (1760, 140)])
+                _speak_async("Starting Jarvis. Loading the model.")
+                return True
+
             audio, overflowed = stream.read(BLOCK_SAMPLES)
             if overflowed:
                 logging.warning("Microphone input overflowed while listening for wake word")
-            scores = wake_model.predict(np.asarray(audio, dtype=np.int16).reshape(-1))
+            audio_frame = np.asarray(audio, dtype=np.int16).reshape(-1)
+            frame_rms = float(np.sqrt(np.mean(audio_frame.astype(np.float32) ** 2)))
+            peak_audio_rms = max(peak_audio_rms, frame_rms)
+            scores = wake_model.predict(audio_frame)
             score = float(scores.get("hey_jarvis_v0.1", 0.0))
+            peak_score = max(peak_score, score)
             if score >= score_threshold:
                 logging.info("Wake phrase detected (score %.3f)", score)
+                _play_chime([(1320, 80), (1760, 140)])
+                _speak_async("Starting Jarvis. Loading the model.")
                 return True
     finally:
         try:
             stream.stop()
         finally:
             stream.close()
-    logging.info("No wake phrase detected; waiting for %s again", os.environ.get("JARVIS_WAKE_KEY", "F9"))
+
+    # Soft low tone indicating listening window ended without detection
+    _play_chime([(440, 120)])
+    logging.info(
+        "No wake phrase detected (peak score %.3f / threshold %.2f; peak frame RMS %.1f); waiting for %s again",
+        peak_score,
+        score_threshold,
+        peak_audio_rms,
+        os.environ.get("JARVIS_WAKE_KEY", "F9"),
+    )
     return False
 
 
@@ -234,7 +306,7 @@ def _launch_model() -> bool:
         environment["JARVIS_OPEN_MODEL_BROWSER"] = "false"
         environment["JARVIS_NO_PAUSE"] = "1"
         model_log = (LOG_DIR / "llama_server.log").open("ab")
-        command = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", f'"{MODEL_START_BAT}"']
+        command = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", str(MODEL_START_BAT)]
         logging.info("Starting llama.cpp with the existing model configuration")
         try:
             _MODEL_PROCESS = subprocess.Popen(
@@ -261,12 +333,15 @@ def _launch_model() -> bool:
     while time.monotonic() < deadline:
         if _model_is_ready(health_url):
             logging.info("Local model server is healthy")
+            _speak_async("Model ready. Launching Jarvis.")
             return True
         if process.poll() is not None:
             logging.error("Model launcher exited with code %s; see logs/llama_server.log", process.returncode)
+            _speak_async("Model server failed to start. Check the logs.")
             return False
         time.sleep(2.0)
     logging.error("Model server did not become healthy within %.0f seconds", wait_seconds)
+    _speak_async("Model server timed out.")
     return False
 
 
@@ -333,6 +408,33 @@ def _start_services() -> bool:
     return True
 
 
+def _stop_process_tree(process: subprocess.Popen | None, name: str) -> None:
+    """Stop a service and any child processes it launched."""
+    if process is None or process.poll() is not None:
+        return
+    try:
+        result = subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode:
+            logging.warning("Could not stop %s process tree: %s", name, result.stderr.strip())
+        process.wait(timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        logging.exception("Could not stop %s (pid %s)", name, process.pid)
+
+
+def _shutdown_services() -> None:
+    """Stop the Jarvis services started by this supervisor."""
+    logging.info("Stopping Jarvis services")
+    _stop_process_tree(_TELEGRAM_PROCESS, "Telegram")
+    _stop_process_tree(_VOICE_PROCESS, "voice assistant")
+    _stop_process_tree(_MODEL_PROCESS, "model server")
+
+
 def main() -> int:
     if sys.platform != "win32":
         print("The Jarvis wake-word launcher currently requires Windows.", file=sys.stderr)
@@ -341,6 +443,10 @@ def main() -> int:
     _configure_logging()
     _load_env_file()
     try:
+        _SHUTDOWN_REQUEST.unlink(missing_ok=True)
+    except OSError:
+        logging.exception("Could not clear an old Jarvis shutdown request")
+    try:
         key_name, vk_code = _wake_key()
         wake_model = None
         logging.info("Wake listener started; press %s, then say 'Hey Jarvis'", key_name)
@@ -348,16 +454,33 @@ def main() -> int:
             # Prepare model files and ONNX sessions at sign-in. The microphone
             # remains closed until the user presses the configured hotkey.
             wake_model = _load_wake_model()
+            logging.info("Wake detector ready; press %s, then speak (or double-press %s)", key_name, key_name)
         except Exception:
             logging.exception("Could not prepare the wake model at sign-in; it will retry after the hotkey")
         while True:
             _wait_for_hotkey(vk_code)
             logging.info("Hotkey %s pressed", key_name)
+            # Wait for key release so the initial press is not interpreted as double-press
+            while bool(ctypes.windll.user32.GetAsyncKeyState(vk_code) & 0x8000):
+                time.sleep(0.02)
             try:
                 if wake_model is None:
                     wake_model = _load_wake_model()
-                if _listen_for_wake_word(wake_model):
+                if _listen_for_wake_word(wake_model, vk_code):
                     if _start_services():
+                        logging.info("Jarvis supervisor is monitoring services")
+                        while not _SHUTDOWN_REQUEST.exists():
+                            services = (_TELEGRAM_PROCESS, _VOICE_PROCESS, _MODEL_PROCESS)
+                            if all(process is None or process.poll() is not None for process in services):
+                                logging.info("All Jarvis services have exited")
+                                return 0
+                            time.sleep(0.25)
+                        _shutdown_services()
+                        try:
+                            _SHUTDOWN_REQUEST.unlink(missing_ok=True)
+                        except OSError:
+                            logging.warning("Could not remove the Jarvis shutdown request file")
+                        logging.info("Jarvis shutdown completed")
                         return 0
             except Exception:
                 logging.exception("Wake attempt failed; press %s to retry", key_name)

@@ -46,9 +46,17 @@ Install the voice dependencies, then register the wake listener in the current W
 powershell -ExecutionPolicy Bypass -File .\install_jarvis_startup.ps1
 ```
 
-After signing in, press **F9** and say **“Hey Jarvis”** within 12 seconds. On first sign-in, the listener downloads its wake and feature models into `data/wakeword_models` and prepares the wake detector; it keeps the microphone closed until the hotkey is pressed. A successful wake starts the existing llama.cpp model, then `voice_jarvis.py` and the Telegram bot. The local model can take several minutes to load; the default wait is five minutes.
+After signing in, press **F9** and say **“Hey Jarvis”** within 18 seconds (or press **F9 twice** to wake immediately without voice). On first sign-in, the listener downloads its wake and feature models into `data/wakeword_models` and prepares the wake detector; it keeps the microphone closed until the hotkey is pressed.
 
-Set `JARVIS_WAKE_KEY` in `.env` to `F1`–`F24`, `PAUSE`, or `SCROLL_LOCK` to change the key. Set `JARVIS_WAKE_TIMEOUT_SECONDS` there to change how long it listens after the key press. Logs are written to `logs/jarvis_wakeword.log`, `logs/llama_server.log`, `logs/voice_jarvis.log`, and `logs/telegram_jarvis.log`. Telegram starts only when `.env` has a configured `TELEGRAM_BOT_TOKEN`.
+- **Audio Feedback**:
+  - **Press F9**: A rising chime (Ding-Dong) sounds immediately to let you know the microphone is active and listening.
+  - **Wake Word Detected** (or double-pressing F9): An upbeat confirmation chime sounds, and Jarvis announces *"Starting Jarvis. Loading the model."*
+  - **Model Ready**: Jarvis announces *"Model ready. Launching Jarvis."*, then `voice_jarvis.py` greets you with *"Jarvis is online. I am listening."*
+  - **Timeout**: A soft low tone sounds if 18 seconds pass without speech.
+
+A successful wake starts the existing llama.cpp model, then `voice_jarvis.py` and the Telegram bot. The local model can take several minutes to load; the default wait is five minutes.
+
+Set `JARVIS_WAKE_KEY` in `.env` to `F1`–`F24`, `PAUSE`, or `SCROLL_LOCK` to change the key. Set `JARVIS_WAKE_TIMEOUT_SECONDS` (default: `18`) and `JARVIS_WAKE_SCORE_THRESHOLD` (default: `0.25`) there to customize sensitivity. Logs are written to `logs/jarvis_wakeword.log`, `logs/llama_server.log`, `logs/voice_jarvis.log`, and `logs/telegram_jarvis.log`. Telegram starts only when `.env` has a configured `TELEGRAM_BOT_TOKEN`.
 
 Remove the automatic start with `powershell -ExecutionPolicy Bypass -File .\install_jarvis_startup.ps1 -Remove`.
 
@@ -58,11 +66,13 @@ Defaults are chosen to suit the existing laptop setup. Set these in the same Pow
 
 ```powershell
 $env:JARVIS_MIC_DEVICE = "1"             # Existing microphone index; use "default" to use Windows default
-$env:JARVIS_STT_MODEL = "large-v3"        # Highest-accuracy Whisper model
+$env:JARVIS_STT_MODEL = "base.en"         # Real-time Faster-Whisper model (<0.4s); use "small.en" or "large-v3" if needed
+$env:JARVIS_STT_BEAM_SIZE = "1"          # 1 for instant greedy decoding
+$env:JARVIS_SILENCE_SECONDS = "0.55"     # Quick speech end cutoff (550ms)
 $env:JARVIS_STT_HOTWORDS = "Jarvis, Antigravity, Chrome, YouTube, Notepad" # Add names you use
 $env:JARVIS_STT_DEVICE = "cpu"
 $env:JARVIS_STT_COMPUTE_TYPE = "int8"
-$env:JARVIS_TTS_BACKEND = "kokoro"       # kokoro or sapi
+$env:JARVIS_TTS_BACKEND = "kokoro"       # kokoro or sapi (sapi gives instant <50ms speech)
 $env:JARVIS_TTS_VOICE = "af_heart"       # Kokoro voice; e.g. af_bella, am_adam, bm_george
 $env:JARVIS_TTS_DEVICE = "cpu"           # Keeps speech synthesis off the 4 GB GPU by default
 $env:JARVIS_LLM_URL = "http://127.0.0.1:8080/v1/chat/completions"
@@ -120,6 +130,7 @@ Or double-click `start_telegram_jarvis.bat`.
 - **Voice Notes:** Hold the Telegram mic button, speak any question or command. Jarvis transcribes with Faster-Whisper, runs Gemma, and replies with an authentic Kokoro neural voice note.
 - **Remote Screenshots:** Ask *"Take a screenshot"* or send `/screenshot` — Jarvis captures the Windows screen and sends the photo directly into your chat.
 - **PC Control:** Control volume (*"set volume to 60%"*), mute, media playback (*"play pause"*), or lock screen (`/lock`).
+- **Full Jarvis Shutdown:** Send `/off` from an authorized private chat to stop the voice assistant, Telegram bot, and model server started by the wake-word launcher.
 - **Interactive Confirmations:** Destructive actions (like PC shutdown) present interactive `[ Confirm ]` / `[ Cancel ]` buttons in Telegram.
 
 ## Files

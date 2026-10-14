@@ -50,6 +50,7 @@ class TelegramSpeechTests(unittest.TestCase):
     def test_telegram_authorization_check(self):
         mock_update = MagicMock()
         mock_update.effective_user.id = 12345
+        mock_update.effective_chat.type = "private"
 
         # With empty allowed users, should reject
         with patch.object(telegram_jarvis, "ALLOWED_USERS", set()):

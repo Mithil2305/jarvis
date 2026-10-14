@@ -20,13 +20,16 @@ if TYPE_CHECKING:
 
 
 SAMPLE_RATE = int(os.environ.get("JARVIS_SAMPLE_RATE", "16000"))
-STT_MODEL_SIZE = os.environ.get("JARVIS_STT_MODEL", "large-v3").strip() or "large-v3"
+STT_MODEL_SIZE = os.environ.get("JARVIS_STT_MODEL", "base.en").strip() or "base.en"
 STT_HOTWORDS = os.environ.get(
     "JARVIS_STT_HOTWORDS",
     "Jarvis, Antigravity, Chrome, YouTube, Notepad, Calculator, Spotify",
 ).strip()
 STT_DEVICE = os.environ.get("JARVIS_STT_DEVICE", "cpu").strip().lower() or "cpu"
 STT_COMPUTE_TYPE = os.environ.get("JARVIS_STT_COMPUTE_TYPE", "int8").strip().lower() or "int8"
+STT_BEAM_SIZE = int(os.environ.get("JARVIS_STT_BEAM_SIZE", "1"))
+STT_BEST_OF = int(os.environ.get("JARVIS_STT_BEST_OF", "1"))
+STT_TEMPERATURE = float(os.environ.get("JARVIS_STT_TEMPERATURE", "0.0"))
 STT_LANGUAGE = os.environ.get("JARVIS_STT_LANGUAGE", "en").strip() or None
 TTS_BACKEND = os.environ.get("JARVIS_TTS_BACKEND", "kokoro").strip().lower() or "kokoro"
 TTS_VOICE = os.environ.get("JARVIS_TTS_VOICE", "af_heart").strip() or "af_heart"
@@ -175,24 +178,16 @@ def transcribe_file(path: str) -> str:
 
     model = _get_stt_model()
     kwargs: dict[str, Any] = {
-        # Spend more search effort on each final transcript. The beam
-        # search helps resolve ambiguous words; best_of applies to the
-        # non-zero-temperature fallback passes.
-        "beam_size": 8,
-        "best_of": 8,
-        "patience": 2.0,
+        "beam_size": STT_BEAM_SIZE,
+        "best_of": STT_BEST_OF,
+        "patience": 1.0,
         "suppress_blank": True,
         "condition_on_previous_text": False,
-        # Temperature ladder: greedy first, then higher-entropy fallbacks.
-        "temperature": [0.0, 0.2, 0.4],
-        # Avoid treating quiet but valid speech as silence or forcing
-        # fallback decoding too early.
+        "temperature": STT_TEMPERATURE,
         "no_speech_threshold": 0.6,
         "log_prob_threshold": -1.0,
         "compression_ratio_threshold": 2.4,
         "word_timestamps": False,
-        # Keep prompt context short; a long command list can bias decoding
-        # toward words that were never spoken.
         "initial_prompt": "Jarvis.",
     }
     if STT_HOTWORDS:

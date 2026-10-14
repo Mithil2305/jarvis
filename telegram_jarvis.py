@@ -20,6 +20,7 @@ import re
 import tempfile
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit, urlunsplit
 
@@ -79,6 +80,7 @@ from jarvis_speech import (
 # ─────────────────────────────────────────────────────────────────────────────
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+SHUTDOWN_REQUEST = Path(__file__).resolve().parent / "logs" / "jarvis_shutdown.request"
 LLM_URL = os.environ.get("JARVIS_LLM_URL", "http://127.0.0.1:8080/v1/chat/completions")
 MODEL_NAME = os.environ.get("JARVIS_MODEL_NAME", "gemma-4")
 VOICE_MODE = os.environ.get("TELEGRAM_VOICE_MODE", "adaptive").strip().lower()  # adaptive | always | never
@@ -453,6 +455,7 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• 💬 **Text Messages:** Type any question, command, or conversation.\n"
         "• 📸 **Screenshots:** Ask 'Take a screenshot' or send `/screenshot`.\n"
         "• 🔒 **Lock Workstation:** Send `/lock` to lock your PC immediately.\n"
+        "• ⏻ **Shut Down Jarvis:** Send `/off` to stop Jarvis and its managed services.\n"
         "• 🔊 **Media & Volume:** 'Set volume to 50%', 'Mute', 'Play pause'.\n\n"
         f"**Engine Status:**\n`{status_str}`\n"
         f"**Local LLM Endpoint:** `{LLM_URL}`\n"
@@ -480,6 +483,25 @@ async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"• **Pending Confirmations:** `{len(_PENDING_ACTIONS)}`"
     )
     await update.message.reply_text(status_report, parse_mode="Markdown")
+
+
+async def handle_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Request a full Jarvis shutdown through the supervising launcher."""
+    if not _is_authorized(update):
+        await _handle_unauthorized(update)
+        return
+
+    try:
+        SHUTDOWN_REQUEST.parent.mkdir(parents=True, exist_ok=True)
+        SHUTDOWN_REQUEST.write_text("shutdown requested via Telegram\n", encoding="utf-8")
+    except OSError as exc:
+        logger.exception("Could not request Jarvis shutdown")
+        await update.message.reply_text(f"Jarvis could not shut down: {exc}")
+        return
+
+    await update.message.reply_text("Shutting down Jarvis and its voice, Telegram, and model services.")
+    # run_polling() handles this signal and closes the Telegram application cleanly.
+    context.application.stop_running()
 
 
 async def handle_screenshot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -658,6 +680,7 @@ def main() -> None:
     # Commands
     application.add_handler(CommandHandler(["start", "help"], handle_start))
     application.add_handler(CommandHandler("status", handle_status))
+    application.add_handler(CommandHandler("off", handle_off))
     application.add_handler(CommandHandler(["screenshot", "screen"], handle_screenshot_cmd))
     application.add_handler(CommandHandler("lock", handle_lock_cmd))
     application.add_handler(CommandHandler(["clear", "reset"], handle_clear_cmd))

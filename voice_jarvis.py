@@ -21,8 +21,8 @@ LLM_URL = os.environ.get("JARVIS_LLM_URL", "http://127.0.0.1:8080/v1/chat/comple
 SAMPLE_RATE = int(os.environ.get("JARVIS_SAMPLE_RATE", "16000"))
 FRAME_MS = 30
 FRAME_SIZE = int(SAMPLE_RATE * FRAME_MS / 1000)
-CALIBRATION_SECONDS = float(os.environ.get("JARVIS_CALIBRATION_SECONDS", "1.0"))
-SILENCE_SECONDS = float(os.environ.get("JARVIS_SILENCE_SECONDS", "1.15"))
+CALIBRATION_SECONDS = float(os.environ.get("JARVIS_CALIBRATION_SECONDS", "0.5"))
+SILENCE_SECONDS = float(os.environ.get("JARVIS_SILENCE_SECONDS", "0.55"))
 MAX_SPEECH_SECONDS = float(os.environ.get("JARVIS_MAX_SPEECH_SECONDS", "20"))
 MIN_SPEECH_SECONDS = float(os.environ.get("JARVIS_MIN_SPEECH_SECONDS", "0.35"))
 PREROLL_FRAMES = 15
@@ -107,18 +107,21 @@ def rms(frame) -> float:
     return float(np.sqrt(np.mean(np.square(frame))))
 
 
-def _record_from_device(device):
-    """Record one utterance using adaptive, hysteresis-based energy detection."""
+_CALIBRATED_THRESHOLDS: dict[object, tuple[float, float, float]] = {}
+
+
+def calibrate_device(device, seconds: float = CALIBRATION_SECONDS) -> tuple[float, float, float]:
+    """Measure ambient room noise once to determine speech detection thresholds."""
+    key = str(device)
+    if key in _CALIBRATED_THRESHOLDS:
+        return _CALIBRATED_THRESHOLDS[key]
+
     audio_queue: queue.Queue = queue.Queue(maxsize=250)
-    pre_roll = deque(maxlen=PREROLL_FRAMES)
 
     def audio_callback(indata, frames, time_info, status):
-        if status and ("overflow" in str(status).lower() or "underflow" in str(status).lower()):
-            print(f"Microphone status: {status}", flush=True)
         try:
             audio_queue.put_nowait(indata[:, 0].copy())
         except queue.Full:
-            # Never block the real-time PortAudio callback.
             pass
 
     print("\nCalibrating microphone noise level...", flush=True)
@@ -132,29 +135,59 @@ def _record_from_device(device):
         callback=audio_callback,
     ):
         calibration_levels = []
-        for _ in range(max(1, int(CALIBRATION_SECONDS * 1000 / FRAME_MS))):
+        for _ in range(max(1, int(seconds * 1000 / FRAME_MS))):
             calibration_levels.append(rms(audio_queue.get(timeout=5)))
 
         noise_level = float(np.median(calibration_levels))
-        # Use a lower adaptive start threshold so normal-volume speech can
-        # trigger recording even when the room or mic has a moderate noise
-        # floor. Keep hysteresis so quiet syllables remain in the utterance.
         start_threshold = min(max(noise_level * 2.0, 0.0035), 0.012)
         stop_threshold = max(noise_level * 1.25, 0.002)
         stop_threshold = min(stop_threshold, start_threshold * 0.8)
 
-        # Discard frames from the calibration interval before waiting for speech.
+    _CALIBRATED_THRESHOLDS[key] = (noise_level, start_threshold, stop_threshold)
+    print(
+        f"Calibrated noise RMS: {noise_level:.4f} | start: {start_threshold:.4f} | "
+        f"stop: {stop_threshold:.4f}",
+        flush=True,
+    )
+    return noise_level, start_threshold, stop_threshold
+
+
+def _record_from_device(device):
+    """Record one utterance using cached calibration and adaptive energy detection."""
+    key = str(device)
+    if key not in _CALIBRATED_THRESHOLDS:
+        noise_level, start_threshold, stop_threshold = calibrate_device(device)
+    else:
+        noise_level, start_threshold, stop_threshold = _CALIBRATED_THRESHOLDS[key]
+
+    audio_queue: queue.Queue = queue.Queue(maxsize=250)
+    pre_roll = deque(maxlen=PREROLL_FRAMES)
+
+    def audio_callback(indata, frames, time_info, status):
+        if status and ("overflow" in str(status).lower() or "underflow" in str(status).lower()):
+            print(f"Microphone status: {status}", flush=True)
+        try:
+            audio_queue.put_nowait(indata[:, 0].copy())
+        except queue.Full:
+            # Never block the real-time PortAudio callback.
+            pass
+
+    with sd.InputStream(
+        device=device,
+        samplerate=SAMPLE_RATE,
+        channels=1,
+        dtype="float32",
+        blocksize=FRAME_SIZE,
+        latency="high",
+        callback=audio_callback,
+    ):
+        # Discard any residual frames from previous playback or stream startup
         while True:
             try:
                 audio_queue.get_nowait()
             except queue.Empty:
                 break
 
-        print(
-            f"Noise RMS: {noise_level:.4f} | start: {start_threshold:.4f} | "
-            f"stop: {stop_threshold:.4f}",
-            flush=True,
-        )
         print("Listening... Speak naturally.", flush=True)
 
         speech_started = False
@@ -171,6 +204,14 @@ def _record_from_device(device):
             pre_roll.append(frame)
 
             if not speech_started:
+                # Smoothly track ambient noise floor during silence without blocking
+                if level < start_threshold:
+                    noise_level = 0.98 * noise_level + 0.02 * level
+                    start_threshold = min(max(noise_level * 2.0, 0.0035), 0.012)
+                    stop_threshold = max(noise_level * 1.25, 0.002)
+                    stop_threshold = min(stop_threshold, start_threshold * 0.8)
+                    _CALIBRATED_THRESHOLDS[key] = (noise_level, start_threshold, stop_threshold)
+
                 loud_run = loud_run + 1 if level >= start_threshold else 0
                 if loud_run >= start_confirm_frames:
                     speech_started = True
@@ -334,11 +375,19 @@ def _complete_action(action_result: str | PendingAction) -> str:
 
 
 def main():
-    print("Jarvis — local voice pipeline", flush=True)
+    print("Jarvis — local voice pipeline (real-time mode)", flush=True)
     print(backend_status(), flush=True)
     print(f"LLM endpoint: {LLM_URL}", flush=True)
     if not LLM_URL.startswith(("http://127.0.0.1", "http://localhost", "http://[::1]")):
         print("WARNING: the configured LLM endpoint is not loopback/local.", flush=True)
+
+    print("Warming up local speech models...", flush=True)
+    from jarvis_speech import _get_stt_model
+    _get_stt_model()
+    try:
+        calibrate_device(MIC_DEVICE)
+    except Exception as exc:
+        print(f"Initial mic calibration note: {exc}", flush=True)
 
     speak("Jarvis is online. I am listening.")
     print("Speak when ready. Say 'stop Jarvis' to exit. Press Ctrl+C to quit.", flush=True)
