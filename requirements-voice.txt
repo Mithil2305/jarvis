@@ -8,8 +8,11 @@ faster-whisper>=1.1,<2
 # PyAV releases in the v17+ line have caused compatibility issues with
 # Faster-Whisper in some environments; keep this install on a known range.
 av>=11,<17
-# Faster-Whisper VAD uses ONNX Runtime. Python 3.10 needs the pre-1.24 line.
+# Faster-Whisper VAD and openWakeWord use ONNX Runtime. Keep Python 3.10 on
+# the pre-1.24 line for the existing Faster-Whisper compatibility constraint.
 onnxruntime<1.24; python_version < "3.11"
+onnxruntime>=1.17,<2; python_version >= "3.11"
+openwakeword>=0.6,<0.7
 pyttsx3>=2.90
 kokoro>=0.9.4,<1
 misaki[en]>=0.7

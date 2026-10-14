@@ -37,6 +37,21 @@ $env:JARVIS_TTS_BACKEND = "sapi"
 
 To return to Kokoro in a new PowerShell session, use the default or run `$env:JARVIS_TTS_BACKEND = "kokoro"`.
 
+## Start Jarvis by voice after Windows sign-in
+
+Install the voice dependencies, then register the wake listener in the current Windows user's Startup folder:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r .\requirements-voice.txt
+powershell -ExecutionPolicy Bypass -File .\install_jarvis_startup.ps1
+```
+
+After signing in, press **F9** and say **“Hey Jarvis”** within 12 seconds. On first sign-in, the listener downloads its wake and feature models into `data/wakeword_models` and prepares the wake detector; it keeps the microphone closed until the hotkey is pressed. A successful wake starts the existing llama.cpp model, then `voice_jarvis.py` and the Telegram bot. The local model can take several minutes to load; the default wait is five minutes.
+
+Set `JARVIS_WAKE_KEY` in `.env` to `F1`–`F24`, `PAUSE`, or `SCROLL_LOCK` to change the key. Set `JARVIS_WAKE_TIMEOUT_SECONDS` there to change how long it listens after the key press. Logs are written to `logs/jarvis_wakeword.log`, `logs/llama_server.log`, `logs/voice_jarvis.log`, and `logs/telegram_jarvis.log`. Telegram starts only when `.env` has a configured `TELEGRAM_BOT_TOKEN`.
+
+Remove the automatic start with `powershell -ExecutionPolicy Bypass -File .\install_jarvis_startup.ps1 -Remove`.
+
 ## Optional settings
 
 Defaults are chosen to suit the existing laptop setup. Set these in the same PowerShell window before launching Jarvis:
@@ -112,6 +127,7 @@ Or double-click `start_telegram_jarvis.bat`.
 - `voice_jarvis.py` — main desktop assistant loop, physical microphone capture, and local LLM connection.
 - `telegram_jarvis.py` — remote Telegram assistant with voice note input/output and remote PC controls.
 - `start_telegram_jarvis.bat` — one-click Windows launcher for the Telegram service.
+- `jarvis_wakeword.py` and `install_jarvis_startup.ps1` — hotkey-gated wake listener and Windows sign-in registration.
 - `jarvis_speech.py` — lazy Faster-Whisper adapter and Kokoro/SAPI5 speech output (both speaker and file generation).
 - `jarvis_actions.py` — desktop action executor (volume, screenshot tracking, system keys).
 - `requirements-voice.txt` — dependency list including Faster-Whisper, Kokoro, and `python-telegram-bot`.

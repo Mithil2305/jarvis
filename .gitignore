@@ -66,6 +66,7 @@ models/**/*.gguf
 # Local data caches
 data/tmp/
 data/cache/
+data/wakeword_models/
 
 # llama.cpp local build outputs
 llama.cpp/build/
