@@ -9,9 +9,10 @@ This repository's primary entry point is `voice_jarvis.py`. It keeps the existin
 ## Speech pipeline
 
 - **Microphone input:** `sounddevice`, with adaptive noise calibration, a short pre-roll buffer, separate speech-start/speech-stop thresholds, silence-based end detection, and near-silence rejection.
-- **Speech-to-text:** local Faster-Whisper (`base.en`, CPU `int8` by default). The model is loaded lazily and reused. The adapter chooses a supported CTranslate2 compute type where the installed build exposes that information, uses VAD to suppress silence-related hallucinations, and cleans up temporary WAV files safely on Windows. Dependencies constrain PyAV to a compatibility range.
+- **Speech-to-text:** local Faster-Whisper (`large-v3`, CPU `int8` by default) performs the only transcription pass, with a wider beam search and optional app-name hotwords. Jarvis avoids a competing live-preview model while recording, preserves the microphone waveform, applies padded VAD, and cleans up temporary WAV files safely on Windows. The model loads lazily and is reused.
+- **Command understanding:** exact action patterns run locally first. Unmatched phrasing goes to the local LLM, which returns either a typed allowlisted action, a spoken answer, or a clarification. The action layer validates targets and values; closing apps, tabs, sleeping, shutting down, and restarting still require spoken confirmation.
 - **Text-to-speech:** local Kokoro neural speech (`af_heart` by default), loaded lazily and reused. If Kokoro fails, Jarvis disables it for the rest of that run and falls back to Windows SAPI5. Set `JARVIS_TTS_BACKEND=sapi` to use only the built-in Windows voice.
-- **LLM:** existing local OpenAI-compatible llama.cpp endpoint at `http://127.0.0.1:8080/v1/chat/completions`. No cloud LLM or cloud TTS endpoint is configured.
+- **LLM:** existing local OpenAI-compatible llama.cpp endpoint at `http://127.0.0.1:8080/v1/chat/completions`. It must be running for fallback command understanding and conversational replies. No cloud LLM or cloud TTS endpoint is configured.
 
 The first Faster-Whisper/Kokoro run may download model weights if they are not already cached. Inference is local. Kokoro's English phonemizer can need eSpeak NG on Windows; if Kokoro cannot initialise, the script falls back to SAPI5 and prints the reason.
 
@@ -42,7 +43,8 @@ Defaults are chosen to suit the existing laptop setup. Set these in the same Pow
 
 ```powershell
 $env:JARVIS_MIC_DEVICE = "1"             # Existing microphone index; use "default" to use Windows default
-$env:JARVIS_STT_MODEL = "base.en"         # e.g. tiny.en, base.en, small.en
+$env:JARVIS_STT_MODEL = "large-v3"        # Highest-accuracy Whisper model
+$env:JARVIS_STT_HOTWORDS = "Jarvis, Antigravity, Chrome, YouTube, Notepad" # Add names you use
 $env:JARVIS_STT_DEVICE = "cpu"
 $env:JARVIS_STT_COMPUTE_TYPE = "int8"
 $env:JARVIS_TTS_BACKEND = "kokoro"       # kokoro or sapi
@@ -67,12 +69,54 @@ It removes only the OpenJarvis checkout/config and the three temporary installer
 
 Start the existing `llama.cpp` server with your current Gemma GGUF and mmproj exactly as you already do. Jarvis expects the OpenAI-compatible chat-completions route on port `8080`. This ZIP does not include model weights or the `llama-server.exe` binary; keep using the ones already on your machine.
 
+## Remote Mobile Access via Telegram Bot
+
+You can access and control Jarvis directly from your mobile phone via Telegram with full voice note support and PC remote control.
+
+### 1. Setup Instructions
+
+1. **Create your Bot Token:**
+   - Open Telegram on your phone or PC and search for `@BotFather`.
+   - Send `/newbot`, name your bot (e.g., `MyPersonalJarvisBot`), and copy the HTTP API token.
+2. **Find your Telegram User ID:**
+   - Open Telegram and message `@userinfobot` to get your numeric Id (e.g. `123456789`).
+   - *(Alternatively, if you run the bot without setting this, it will automatically reject access and print your ID in the chat!)*
+3. **Configure `.env`:**
+   - Copy `.env.example` to `.env`:
+     ```powershell
+     Copy-Item .env.example .env
+     ```
+   - Open `.env` and fill in:
+     ```ini
+     TELEGRAM_BOT_TOKEN="your_token_from_botfather"
+     TELEGRAM_ALLOWED_USER_IDS="your_telegram_numeric_id"
+     TELEGRAM_VOICE_MODE="adaptive"
+     ```
+
+### 2. Running the Telegram Bot
+
+Run from PowerShell:
+```powershell
+.\.venv\Scripts\python.exe .\telegram_jarvis.py
+```
+Or double-click `start_telegram_jarvis.bat`.
+
+### 3. Mobile Capabilities
+- **Voice Notes:** Hold the Telegram mic button, speak any question or command. Jarvis transcribes with Faster-Whisper, runs Gemma, and replies with an authentic Kokoro neural voice note.
+- **Remote Screenshots:** Ask *"Take a screenshot"* or send `/screenshot` — Jarvis captures the Windows screen and sends the photo directly into your chat.
+- **PC Control:** Control volume (*"set volume to 60%"*), mute, media playback (*"play pause"*), or lock screen (`/lock`).
+- **Interactive Confirmations:** Destructive actions (like PC shutdown) present interactive `[ Confirm ]` / `[ Cancel ]` buttons in Telegram.
+
 ## Files
 
-- `voice_jarvis.py` — main assistant loop, microphone capture, and local LLM connection.
-- `jarvis_speech.py` — lazy Faster-Whisper adapter and Kokoro/SAPI5 speech output.
-- `requirements-voice.txt` — minimal dependency list for this entry point.
+- `voice_jarvis.py` — main desktop assistant loop, physical microphone capture, and local LLM connection.
+- `telegram_jarvis.py` — remote Telegram assistant with voice note input/output and remote PC controls.
+- `start_telegram_jarvis.bat` — one-click Windows launcher for the Telegram service.
+- `jarvis_speech.py` — lazy Faster-Whisper adapter and Kokoro/SAPI5 speech output (both speaker and file generation).
+- `jarvis_actions.py` — desktop action executor (volume, screenshot tracking, system keys).
+- `requirements-voice.txt` — dependency list including Faster-Whisper, Kokoro, and `python-telegram-bot`.
 - `remove_openjarvis.ps1` — optional cleanup of the separate OpenJarvis installation/config.
 - Older `voice_jarvis_*` files remain as reference/rollback versions; use `voice_jarvis.py` for the integrated pipeline.
 
 The STT/TTS adapter design is inspired by the lazy local-backend approach in [OpenJarvis's Faster-Whisper and Kokoro adapters](https://github.com/open-jarvis/OpenJarvis/tree/main/src/openjarvis/speech). The Jarvis runtime does not import or invoke OpenJarvis.
+

@@ -13,11 +13,18 @@ import os
 import re
 import tempfile
 import threading
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import numpy as np
 
 
 SAMPLE_RATE = int(os.environ.get("JARVIS_SAMPLE_RATE", "16000"))
-STT_MODEL_SIZE = os.environ.get("JARVIS_STT_MODEL", "small.en").strip() or "small.en"
+STT_MODEL_SIZE = os.environ.get("JARVIS_STT_MODEL", "large-v3").strip() or "large-v3"
+STT_HOTWORDS = os.environ.get(
+    "JARVIS_STT_HOTWORDS",
+    "Jarvis, Antigravity, Chrome, YouTube, Notepad, Calculator, Spotify",
+).strip()
 STT_DEVICE = os.environ.get("JARVIS_STT_DEVICE", "cpu").strip().lower() or "cpu"
 STT_COMPUTE_TYPE = os.environ.get("JARVIS_STT_COMPUTE_TYPE", "int8").strip().lower() or "int8"
 STT_LANGUAGE = os.environ.get("JARVIS_STT_LANGUAGE", "en").strip() or None
@@ -71,7 +78,7 @@ def _resolve_stt_compute_type(device: str, requested: str) -> str:
 
 
 def _get_stt_model():
-    """Load Faster-Whisper on first use; reuse it for every later request."""
+    """Load and reuse the configured high-accuracy Faster-Whisper model."""
     global _STT_MODEL
     with _STT_LOCK:
         if _STT_MODEL is not None:
@@ -107,27 +114,17 @@ def _get_stt_model():
         return _STT_MODEL
 
 
-def _preprocess_audio(samples) -> "np.ndarray":
-    """Normalize amplitude and apply pre-emphasis for clearer STT input.
+def _preprocess_audio(samples) -> np.ndarray:
+    """Pass the natural microphone waveform to Whisper without distortion.
 
-    Two-step pipeline:
-    1. Amplitude normalization — scales the peak to 90 % of full scale so that
-       quiet microphone captures are as loud as Whisper expects.  Recordings
-       whose peak is already fine (> 0.5) are left alone to avoid clipping.
-    2. Pre-emphasis filter — y[n] = x[n] - 0.97 * x[n-1].  This boosts
-       high-frequency consonants (s, t, k, p …) that Whisper uses heavily for
-       word boundaries and that are disproportionately attenuated by low-end
-       microphones.
+    Whisper's encoder expects speech with its original spectral balance. A
+    near-unit pre-emphasis filter disproportionately boosts high frequencies
+    and can push samples outside the valid PCM range. Peak-based normalization
+    also made gain depend on occasional transients rather than speech level.
     """
     import numpy as np
 
-    peak = float(np.max(np.abs(samples)))
-    if 0.005 < peak < 0.5:          # only normalize genuinely quiet recordings
-        samples = (samples / peak * 0.90).astype(np.float32)
-    # pre-emphasis
-    out = samples.copy()
-    out[1:] = samples[1:] - 0.97 * samples[:-1]
-    return out.astype(np.float32)
+    return np.asarray(samples, dtype=np.float32)
 
 
 def transcribe_audio(audio, sample_rate: int = SAMPLE_RATE) -> str:
@@ -152,7 +149,7 @@ def transcribe_audio(audio, sample_rate: int = SAMPLE_RATE) -> str:
         )
         return ""
 
-    # Pre-process: normalize + pre-emphasis before handing to Whisper.
+    # Preserve the microphone waveform before handing it to Whisper.
     samples = _preprocess_audio(samples)
 
     path = None
@@ -162,89 +159,94 @@ def transcribe_audio(audio, sample_rate: int = SAMPLE_RATE) -> str:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             path = tmp.name
         sf.write(path, samples, sample_rate, format="WAV", subtype="PCM_16")
-
-        model = _get_stt_model()
-        kwargs: dict[str, Any] = {
-            "beam_size": 5,
-            "best_of": 5,
-            # patience > 1.0 lets beam search explore more candidates before
-            # committing, which helps with short or unclear utterances.
-            "patience": 1.5,
-            "suppress_blank": True,
-            "condition_on_previous_text": False,
-            # Temperature ladder: greedy first, then higher-entropy fallbacks.
-            "temperature": [0.0, 0.2, 0.4],
-            "no_speech_threshold": 0.45,
-            "log_prob_threshold": -0.8,
-            "compression_ratio_threshold": 2.4,
-            "word_timestamps": False,
-            "initial_prompt": (
-                "Hey Jarvis, close all Chrome tabs. Set volume to fifty percent. "
-                "Open Notepad. Open YouTube. Take a screenshot. Mute. Unmute. "
-                "Increase volume. Decrease brightness. Lock the screen. "
-                "Shutdown the computer. Restart the computer. Play music. Pause. "
-                "Adjust my volume. What time is it? Open Chrome."
-            ),
-        }
-        if STT_LANGUAGE:
-            kwargs["language"] = STT_LANGUAGE
-
-        # VAD reduces silence-related hallucinations. If the optional VAD
-        # runtime is unavailable, retry once without VAD rather than failing
-        # the entire voice turn.
-        try:
-            segments_iter, info = model.transcribe(
-                path,
-                vad_filter=True,
-                vad_parameters={
-                    # 250 ms is short enough to catch commands like "Mute".
-                    "min_silence_duration_ms": 250,
-                    "speech_pad_ms": 200,
-                    "min_speech_duration_ms": 100,
-                },
-                **kwargs,
-            )
-            segments = list(segments_iter)
-        except (ImportError, RuntimeError) as exc:
-            message = str(exc).lower()
-            if not any(token in message for token in ("onnx", "vad", "silero")):
-                raise
-            print(f"Whisper VAD unavailable; retrying without VAD: {exc}", flush=True)
-            segments_iter, info = model.transcribe(path, vad_filter=False, **kwargs)
-            segments = list(segments_iter)
-
-        accepted = []
-        for segment in segments:
-            piece = str(getattr(segment, "text", "")).strip()
-            if not piece:
-                continue
-            no_speech = float(getattr(segment, "no_speech_prob", 0.0) or 0.0)
-            avg_logprob = float(getattr(segment, "avg_logprob", 0.0) or 0.0)
-            # Tighter hallucination filter: drop if no-speech prob is high OR
-            # log-probability is very low (garbled / noise-only segment).
-            if no_speech > 0.65 and avg_logprob < -1.0:
-                print(f"Ignoring likely speech hallucination: {piece!r}", flush=True)
-                continue
-            if avg_logprob < -1.5:
-                print(f"Ignoring very low-confidence segment: {piece!r}", flush=True)
-                continue
-            accepted.append(piece)
-
-        transcript = " ".join(accepted).strip()
-        if not transcript:
-            print("No reliable speech was recognized.", flush=True)
-        else:
-            detected_language = getattr(info, "language", None)
-            if detected_language:
-                print(f"Recognized language: {detected_language}", flush=True)
-            transcript = _apply_stt_corrections(transcript)
-        return transcript
+        return transcribe_file(path)
     finally:
         if path and os.path.exists(path):
             try:
                 os.unlink(path)
             except OSError as exc:
                 print(f"Warning: couldn't remove temporary audio file: {exc}", flush=True)
+
+
+def transcribe_file(path: str) -> str:
+    """Transcribe an audio file from disk (e.g. WAV, OGG, MP3) using Faster-Whisper."""
+    if not path or not os.path.exists(path):
+        return ""
+
+    model = _get_stt_model()
+    kwargs: dict[str, Any] = {
+        # Spend more search effort on each final transcript. The beam
+        # search helps resolve ambiguous words; best_of applies to the
+        # non-zero-temperature fallback passes.
+        "beam_size": 8,
+        "best_of": 8,
+        "patience": 2.0,
+        "suppress_blank": True,
+        "condition_on_previous_text": False,
+        # Temperature ladder: greedy first, then higher-entropy fallbacks.
+        "temperature": [0.0, 0.2, 0.4],
+        # Avoid treating quiet but valid speech as silence or forcing
+        # fallback decoding too early.
+        "no_speech_threshold": 0.6,
+        "log_prob_threshold": -1.0,
+        "compression_ratio_threshold": 2.4,
+        "word_timestamps": False,
+        # Keep prompt context short; a long command list can bias decoding
+        # toward words that were never spoken.
+        "initial_prompt": "Jarvis.",
+    }
+    if STT_HOTWORDS:
+        kwargs["hotwords"] = STT_HOTWORDS
+    if STT_LANGUAGE:
+        kwargs["language"] = STT_LANGUAGE
+
+    # Keep VAD's speech boundaries padded so quiet word beginnings and
+    # endings survive noise filtering.
+    try:
+        segments_iter, info = model.transcribe(
+            path,
+            vad_filter=True,
+            vad_parameters={
+                "threshold": 0.35,
+                "min_speech_duration_ms": 100,
+                "min_silence_duration_ms": 400,
+                "speech_pad_ms": 450,
+            },
+            **kwargs,
+        )
+        segments = list(segments_iter)
+    except (ImportError, RuntimeError) as exc:
+        message = str(exc).lower()
+        if not any(token in message for token in ("onnx", "vad", "silero")):
+            raise
+        print(f"Whisper VAD unavailable; retrying without VAD: {exc}", flush=True)
+        segments_iter, info = model.transcribe(path, vad_filter=False, **kwargs)
+        segments = list(segments_iter)
+
+    accepted = []
+    for segment in segments:
+        piece = str(getattr(segment, "text", "")).strip()
+        if not piece:
+            continue
+        no_speech = float(getattr(segment, "no_speech_prob", 0.0) or 0.0)
+        avg_logprob = float(getattr(segment, "avg_logprob", 0.0) or 0.0)
+        # Reject only segments that look like silence and are also weakly
+        # decoded. A low log probability alone is not enough to discard
+        # quiet accented speech.
+        if no_speech > 0.7 and avg_logprob < -1.2:
+            print(f"Ignoring likely speech hallucination: {piece!r}", flush=True)
+            continue
+        accepted.append(piece)
+
+    transcript = " ".join(accepted).strip()
+    if not transcript:
+        print("No reliable speech was recognized.", flush=True)
+    else:
+        detected_language = getattr(info, "language", None)
+        if detected_language:
+            print(f"Recognized language: {detected_language}", flush=True)
+        transcript = _apply_stt_corrections(transcript)
+    return transcript
 
 
 # ---------------------------------------------------------------------------
@@ -419,13 +421,10 @@ def _speak_sapi(text: str) -> None:
     engine.runAndWait()
 
 
-def _speak_kokoro(text: str) -> None:
+def generate_speech_audio(text: str) -> tuple[Any, int]:
+    """Generate audio waveform using Kokoro. Returns (np.ndarray of float32, sample_rate)."""
     import numpy as np
-    import sounddevice as sd
 
-    # Kokoro supports multi-sentence input itself; our outer chunks only cap
-    # unusually long responses. Concatenate all generated audio before playback
-    # so the listener does not hear an artificial stop between sentences.
     voice_prefix = TTS_VOICE[:1]
     lang_code = voice_prefix if voice_prefix in set("abzjfiphe") else "a"
     pipeline = _get_kokoro_pipeline(lang_code)
@@ -440,8 +439,126 @@ def _speak_kokoro(text: str) -> None:
     audio_out = np.concatenate(samples)
     if not np.isfinite(audio_out).all():
         raise SpeechBackendError("Kokoro produced non-finite audio values.")
+    return audio_out, 24000
+
+
+def synthesize_to_file(text: str, output_path: str) -> str:
+    """Synthesize a Telegram-compatible OGG/Opus voice message."""
+    global _KOKORO_DISABLED
+
+    clean = str(text or "").strip()
+    if not clean:
+        raise SpeechBackendError("Cannot synthesize an empty response.")
+
+    backend = TTS_BACKEND
+    if backend not in {"kokoro", "sapi", "sapi5"}:
+        print(f"Unknown JARVIS_TTS_BACKEND={backend!r}; using Kokoro with SAPI5 fallback.", flush=True)
+        backend = "kokoro"
+
+    with _TTS_LOCK:
+        if backend in {"sapi", "sapi5"} or _KOKORO_DISABLED:
+            audio_out, rate = _generate_sapi_audio(clean)
+        else:
+            try:
+                audio_out, rate = generate_speech_audio(clean)
+            except Exception as exc:
+                _KOKORO_DISABLED = True
+                print(
+                    f"Kokoro file synthesis failed ({type(exc).__name__}: {exc}); "
+                    "switching to Windows SAPI5 for this and later responses.",
+                    flush=True,
+                )
+                audio_out, rate = _generate_sapi_audio(clean)
+        audio_out = _resample_mono(audio_out, rate)
+        _write_ogg_opus(audio_out, output_path)
+    return output_path
+
+
+def _speak_kokoro(text: str) -> None:
+    import sounddevice as sd
+
+    # Kokoro supports multi-sentence input itself; our outer chunks only cap
+    # unusually long responses. Concatenate all generated audio before playback
+    # so the listener does not hear an artificial stop between sentences.
+    audio_out, rate = generate_speech_audio(text)
     sd.stop()
-    sd.play(audio_out, samplerate=24000, blocking=True)
+    sd.play(audio_out, samplerate=rate, blocking=True)
+
+
+
+def _resample_mono(audio, source_rate: int, target_rate: int = 24000):
+    """Convert a waveform to mono float32 at the rate used for Telegram audio."""
+    import numpy as np
+
+    samples = np.asarray(audio, dtype=np.float32)
+    if samples.ndim == 2:
+        samples = samples.mean(axis=1)
+    else:
+        samples = samples.reshape(-1)
+    if samples.size == 0 or source_rate <= 0:
+        raise SpeechBackendError("The speech backend produced an empty audio clip.")
+    if source_rate != target_rate:
+        output_size = max(1, round(samples.size * target_rate / source_rate))
+        old_positions = np.arange(samples.size, dtype=np.float64)
+        new_positions = np.arange(output_size, dtype=np.float64) * source_rate / target_rate
+        samples = np.interp(new_positions, old_positions, samples).astype(np.float32)
+    if not np.isfinite(samples).all():
+        raise SpeechBackendError("The speech backend produced non-finite audio values.")
+    return np.clip(samples, -1.0, 1.0)
+
+
+def _generate_sapi_audio(text: str) -> tuple[Any, int]:
+    """Render SAPI speech to a temporary WAV and return a mono waveform."""
+    import soundfile as sf
+
+    wav_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            wav_path = tmp.name
+        with _TTS_LOCK:
+            engine = _get_sapi_engine()
+            engine.stop()
+            engine.save_to_file(text, wav_path)
+            engine.runAndWait()
+        samples, sample_rate = sf.read(wav_path, dtype="float32", always_2d=True)
+        return _resample_mono(samples, int(sample_rate)), 24000
+    finally:
+        if wav_path and os.path.exists(wav_path):
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
+
+
+def _write_ogg_opus(audio, output_path: str, sample_rate: int = 24000) -> None:
+    """Write mono Opus frames in an OGG container for Telegram voice messages."""
+    import av
+    import numpy as np
+    from fractions import Fraction
+
+    samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if samples.size == 0:
+        raise SpeechBackendError("Cannot encode an empty voice message.")
+
+    frame_size = 960  # 40 ms at 24 kHz, a supported Opus frame duration.
+    with av.open(output_path, mode="w", format="ogg") as container:
+        stream = container.add_stream("libopus", rate=sample_rate)
+        stream.codec_context.layout = "mono"
+        stream.codec_context.bit_rate = 32000
+        for start in range(0, samples.size, frame_size):
+            frame_samples = np.zeros(frame_size, dtype=np.float32)
+            chunk = samples[start : start + frame_size]
+            frame_samples[: chunk.size] = chunk
+            frame = av.AudioFrame.from_ndarray(
+                frame_samples.reshape(1, -1), format="flt", layout="mono"
+            )
+            frame.sample_rate = sample_rate
+            frame.pts = start
+            frame.time_base = Fraction(1, sample_rate)
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode(None):
+            container.mux(packet)
 
 
 def speak(text: str) -> bool:

@@ -1,6 +1,7 @@
 """Jarvis voice assistant: microphone -> local STT -> local Gemma -> local TTS."""
 from __future__ import annotations
 
+import json
 import os
 import queue
 import re
@@ -12,7 +13,7 @@ import requests
 import sounddevice as sd
 
 from jarvis_speech import backend_status, speak, transcribe_audio
-from jarvis_actions import handle_command, PendingAction
+from jarvis_actions import handle_command, handle_structured_command, PendingAction
 
 
 # ---------------- CONFIGURATION ----------------
@@ -37,13 +38,31 @@ else:
 
 SYSTEM_PROMPT = """
 You are Jarvis, a helpful personal desktop voice assistant running on Windows.
-You CAN execute real desktop actions: open/close apps, control volume, take screenshots,
-open websites, control media playback, lock the screen, and more.
-For commands you can execute, do so — your action layer handles them automatically.
-For everything else, answer in natural spoken English, normally in one to three concise sentences.
-Use plain text without Markdown, tables, bullet lists, code fences, or LaTeX unless
-the user specifically asks for a written or technical format.
-Remember the recent conversation.
+Interpret the user's latest request using the conversation history. Return exactly one JSON object,
+with no Markdown or text outside the JSON. Use one of these forms:
+{"type":"action","intent":"...","target":null,"url":null,"value":null,"direction":null,"confidence":0.0}
+{"type":"response","text":"..."}
+{"type":"clarify","text":"..."}
+
+Use an action only for a clear, direct request. Allowed intents are: open_app, open_website,
+open_new_tab, close_app, close_chrome_tabs, close_current_tab, set_volume, adjust_volume,
+set_brightness, adjust_brightness, mute, unmute, play_pause, stop_media, next_track,
+previous_track, take_screenshot, lock_screen, sleep_pc, shutdown_pc, restart_pc, cancel_shutdown.
+For open_app/open_website/close_app, provide target. For open_new_tab, provide a complete
+http/https url or a known website name as target. For set_volume/set_brightness, provide a
+numeric value from 0 to 100. For adjust_volume/adjust_brightness, direction must be increase
+or decrease. Include a confidence number from 0 to 1 for every action; use clarify when the
+intent or required target is ambiguous. Do not infer an action from quoted text or a question
+that merely discusses an action, or from a request that negates/cancels the action. Never return
+shell commands or claim an action was completed.
+
+Examples:
+"Could you close Antigravity?" -> close_app with target "Antigravity".
+"Turn the volume down a little." -> adjust_volume with direction "decrease".
+"What happens when I close all Chrome tabs?" -> {"type":"response","text":"Explain what closing the tabs does."}
+
+For ordinary questions or conversation, use type=response with a natural, concise spoken-English
+answer in text. Remember the recent conversation.
 """.strip()
 
 messages: list[dict[str, str]] = []
@@ -56,15 +75,31 @@ messages: list[dict[str, str]] = []
 _AFFIRMATIVE = {
     "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "go",
     "do it", "proceed", "confirm", "confirmed", "correct", "right",
-    "affirmative", "definitely", "absolutely", "please", "fine",
+    "affirmative", "definitely", "absolutely", "fine",
 }
+
+_DISCUSSION_OR_NEGATION = re.compile(
+    r"^\s*(?:what|why|how|when|where|who|which)\b|"
+    r"^\s*(?:explain|describe|define|tell\s+me\b)\b|"
+    r"\b(?:how\s+to|what\s+does|what\s+if)\b|"
+    r"\b(?:do\s+not|don['’]?t|doesn['’]?t|didn['’]?t|shouldn['’]?t|"
+    r"wouldn['’]?t|won['’]?t|can['’]?t|cannot|never|without|avoid|not)\b",
+    re.IGNORECASE,
+)
 
 
 def _is_affirmative(text: str) -> bool:
     """Return True when the user's reply is a clear yes/confirmation."""
-    # Strip all punctuation and check for any affirmative word.
+    # Reject any explicit negation before looking for affirmative words, so
+    # phrases such as "no, don't" cannot accidentally approve an action.
     clean = re.sub(r"[^\w\s]", "", text.lower()).strip()
-    return bool(set(clean.split()) & _AFFIRMATIVE)
+    words = clean.split()
+    if set(words) & {"no", "not", "never", "cancel", "dont", "don't", "nope"}:
+        return False
+    if clean in _AFFIRMATIVE:
+        return True
+    single_word_answers = {answer for answer in _AFFIRMATIVE if " " not in answer}
+    return bool(set(words) & single_word_answers)
 
 
 def rms(frame) -> float:
@@ -101,11 +136,12 @@ def _record_from_device(device):
             calibration_levels.append(rms(audio_queue.get(timeout=5)))
 
         noise_level = float(np.median(calibration_levels))
-        # Distinct start/stop thresholds prevent brief noise from starting a
-        # recording while preserving softer syllables after speech begins.
-        start_threshold = min(max(noise_level * 2.7, 0.0055), 0.014)
-        stop_threshold = max(noise_level * 1.45, 0.0035)
-        stop_threshold = min(stop_threshold, start_threshold * 0.75)
+        # Use a lower adaptive start threshold so normal-volume speech can
+        # trigger recording even when the room or mic has a moderate noise
+        # floor. Keep hysteresis so quiet syllables remain in the utterance.
+        start_threshold = min(max(noise_level * 2.0, 0.0035), 0.012)
+        stop_threshold = max(noise_level * 1.25, 0.002)
+        stop_threshold = min(stop_threshold, start_threshold * 0.8)
 
         # Discard frames from the calibration interval before waiting for speech.
         while True:
@@ -190,13 +226,68 @@ def record_until_silence():
         raise
 
 
-def ask_gemma(text: str) -> str:
-    """Send the conversation to the existing local llama.cpp endpoint."""
+_ALLOWED_LLM_INTENTS = {
+    "open_app", "open_website", "open_new_tab", "close_app",
+    "close_chrome_tabs", "close_current_tab", "set_volume", "adjust_volume",
+    "set_brightness", "adjust_brightness", "mute", "unmute", "play_pause",
+    "stop_media", "next_track", "previous_track", "take_screenshot",
+    "lock_screen", "sleep_pc", "shutdown_pc", "restart_pc", "cancel_shutdown",
+}
+
+
+def _parse_gemma_route(content: str) -> dict[str, object]:
+    """Parse and constrain the local model's JSON route before it reaches actions."""
+    raw = content.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE).strip()
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start < 0 or end < start:
+        return {
+            "type": "clarify",
+            "text": "I had trouble understanding that. Could you say it another way?",
+        }
+    try:
+        result = json.loads(raw[start : end + 1])
+    except json.JSONDecodeError:
+        return {
+            "type": "clarify",
+            "text": "I had trouble understanding that. Could you say it another way?",
+        }
+    if not isinstance(result, dict):
+        return {"type": "clarify", "text": "Could you rephrase that request?"}
+
+    route_type = result.get("type")
+    if route_type == "action":
+        intent = result.get("intent")
+        confidence = result.get("confidence")
+        if (
+            not isinstance(intent, str)
+            or intent not in _ALLOWED_LLM_INTENTS
+            or isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))
+            or not 0 <= confidence <= 1
+        ):
+            return {
+                "type": "clarify",
+                "text": "I couldn't safely interpret that command. Could you rephrase it?",
+            }
+        return result
+
+    if route_type in {"response", "clarify"}:
+        text = result.get("text")
+        if isinstance(text, str) and text.strip():
+            return {"type": route_type, "text": text.strip()}
+    return {"type": "clarify", "text": "Could you rephrase that request?"}
+
+
+def ask_gemma(text: str) -> dict[str, object]:
+    """Ask the local LLM for either a safe action intent or a spoken response."""
     recent = [*messages, {"role": "user", "content": text}][-10:]
     payload = {
         "model": os.environ.get("JARVIS_MODEL_NAME", "gemma-4"),
         "messages": [{"role": "system", "content": SYSTEM_PROMPT}, *recent],
-        "temperature": 0.4,
+        "temperature": 0.1,
         "max_tokens": int(os.environ.get("JARVIS_MAX_TOKENS", "160")),
         "stream": False,
     }
@@ -204,17 +295,42 @@ def ask_gemma(text: str) -> str:
     response.raise_for_status()
 
     try:
-        answer = (response.json()["choices"][0]["message"]["content"] or "").strip()
+        content = (response.json()["choices"][0]["message"]["content"] or "").strip()
     except (KeyError, IndexError, TypeError) as exc:
         raise RuntimeError("The local LLM returned an unexpected response format.") from exc
-    if not answer:
+    if not content:
         raise RuntimeError("The local Gemma model returned an empty response.")
+    return _parse_gemma_route(content)
 
-    # Commit the turn only after a valid answer is received, preventing a failed
-    # HTTP request from leaving unmatched user messages in the history.
-    messages.extend(({"role": "user", "content": text}, {"role": "assistant", "content": answer}))
+
+def _remember_turn(user_text: str, assistant_text: str) -> None:
+    """Keep a compact history so follow-up requests can resolve references."""
+    messages.extend((
+        {"role": "user", "content": user_text},
+        {"role": "assistant", "content": assistant_text},
+    ))
     del messages[:-20]
-    return answer
+
+
+def _complete_action(action_result: str | PendingAction) -> str:
+    """Resolve a pending action only after a clear spoken confirmation."""
+    if not isinstance(action_result, PendingAction):
+        return action_result
+
+    speak(action_result.confirmation_prompt)
+    print("[confirm] Waiting for yes/no...", flush=True)
+    try:
+        confirm_audio = record_until_silence()
+        if confirm_audio is None:
+            return "No response received. Action cancelled."
+        confirm_text = transcribe_audio(confirm_audio, SAMPLE_RATE)
+        print(f"[confirm] Heard: {confirm_text!r}", flush=True)
+        if _is_affirmative(confirm_text):
+            return action_result.execute()
+        return "Okay, action cancelled."
+    except Exception as exc:
+        print(f"[confirm] Error during confirmation: {exc}", flush=True)
+        return "I could not hear your confirmation. Action cancelled."
 
 
 def main():
@@ -248,39 +364,41 @@ def main():
                 speak("Goodbye.")
                 break
 
-            # ── Command intercept ──────────────────────────────────────────
-            # Try to execute as a desktop action first.  Only fall through to
-            # the LLM when no action pattern matches.
-            action_result = handle_command(text)
-
-            if isinstance(action_result, PendingAction):
-                # Destructive command — ask for verbal confirmation.
-                speak(action_result.confirmation_prompt)
-                print("[confirm] Waiting for yes/no...", flush=True)
-                try:
-                    confirm_audio = record_until_silence()
-                    if confirm_audio is not None:
-                        confirm_text = transcribe_audio(confirm_audio, SAMPLE_RATE)
-                        print(f"[confirm] Heard: {confirm_text!r}", flush=True)
-                        if _is_affirmative(confirm_text):
-                            final = action_result.execute()
-                            speak(final)
-                        else:
-                            speak("Okay, action cancelled.")
-                    else:
-                        speak("No response received. Action cancelled.")
-                except Exception as confirm_exc:
-                    print(f"[confirm] Error during confirmation: {confirm_exc}", flush=True)
-                    speak("I could not hear your confirmation. Action cancelled.")
-                continue
-
+            # ── Direct command intercept ────────────────────────────────────
+            # Keep deterministic command matches local. The LLM router is a
+            # fallback for varied phrasing and returns a typed action schema.
+            # Direct action regexes intentionally support short commands, so a
+            # discussion such as "What does mute mean?" or a negation such as
+            # "Don't mute" must go through the intent router instead.
+            action_result = (
+                None
+                if _DISCUSSION_OR_NEGATION.search(text)
+                else handle_command(text)
+            )
             if action_result is not None:
-                speak(action_result)
+                answer = _complete_action(action_result)
+                speak(answer)
+                _remember_turn(text, answer)
                 continue
 
-            print("Thinking with local Gemma...", flush=True)
-            answer = ask_gemma(text)
+            print("Interpreting with local Gemma...", flush=True)
+            route = ask_gemma(text)
+            route_type = route.get("type")
+            if route_type == "action":
+                print(
+                    f"[router] Intent: {route.get('intent')} | "
+                    f"confidence: {route.get('confidence')}",
+                    flush=True,
+                )
+                action_result = handle_structured_command(route)
+                if action_result is None:
+                    answer = "I couldn't safely map that request to an action. Could you rephrase it?"
+                else:
+                    answer = _complete_action(action_result)
+            else:
+                answer = str(route.get("text", "Could you rephrase that request?"))
             speak(answer)
+            _remember_turn(text, answer)
 
         except KeyboardInterrupt:
             print("\nJarvis stopped.", flush=True)

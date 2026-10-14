@@ -12,13 +12,15 @@ through to the LLM).
 from __future__ import annotations
 
 import os
+import math
 import re
 import shutil
 import subprocess
 import sys
 import webbrowser
 from datetime import datetime
-from typing import Callable, Optional, Union
+from typing import Any, Callable, Optional, Union
+from urllib.parse import urlsplit
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -50,6 +52,10 @@ class PendingAction:
 
     def __repr__(self) -> str:
         return f"PendingAction({self.confirmation_prompt!r})"
+
+
+class UnsupportedApplicationError(RuntimeError):
+    """Raised when the local app map cannot resolve an application name."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -155,7 +161,7 @@ def mute_volume() -> str:
     try:
         vol = _get_volume_interface()
         vol.SetMute(1, None)
-        return "Microphone muted."
+        return "System audio muted."
     except Exception:
         import pyautogui  # type: ignore
         pyautogui.press("volumemute")
@@ -283,6 +289,11 @@ _URL_MAP: dict[str, str] = {
 
 def open_app(name: str) -> str:
     lower = name.lower().strip()
+    # Chrome has a dedicated launcher that searches the common Windows install
+    # paths; it is not usually on PATH like the other executables below.
+    if re.fullmatch(r"(?:google\s+)?chrome(?:\s+browser)?", lower):
+        return open_chrome()
+
     # Website?
     for keyword, url in _URL_MAP.items():
         if keyword in lower:
@@ -299,7 +310,7 @@ def open_app(name: str) -> str:
         else:
             subprocess.Popen([exe], shell=True)
         return f"Opening {name}."
-    raise RuntimeError(f"I don't know how to open '{name}'.")
+    raise UnsupportedApplicationError(f"I don't know how to open '{name}'.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -334,18 +345,30 @@ def media_stop() -> str:
 # System
 # ─────────────────────────────────────────────────────────────────────────────
 
+_LAST_SCREENSHOT_PATH: Optional[str] = None
+
+
+def get_last_screenshot() -> Optional[str]:
+    """Return the filesystem path of the most recently captured screenshot."""
+    return _LAST_SCREENSHOT_PATH
+
+
 def take_screenshot() -> str:
+    global _LAST_SCREENSHOT_PATH
+    _LAST_SCREENSHOT_PATH = None
     try:
         import pyautogui  # type: ignore
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         desktop = os.path.join(os.path.expanduser("~"), "Desktop")
         path = os.path.join(desktop, f"screenshot_{ts}.png")
         pyautogui.screenshot(path)
+        _LAST_SCREENSHOT_PATH = path
         return f"Screenshot saved to your Desktop as screenshot_{ts}.png."
     except ImportError:
         import pyautogui  # type: ignore
         pyautogui.hotkey("win", "shift", "s")
         return "Screenshot tool opened."
+
 
 
 def lock_screen() -> str:
@@ -418,7 +441,12 @@ def _h_adj_volume(m: re.Match, text: str) -> str:
     return None  # type: ignore  # fall through to LLM
 
 
-@_register(r"\b(mute|silence)\s+(the\s+)?(volume|sound|audio|mic|microphone)?\b")
+@_register(r"\b(mute|silence|unmute)\s+(?:the\s+)?(?:mic|microphone)\b")
+def _h_mute_microphone(m: re.Match, text: str) -> str:
+    return "I can mute system audio, but I can't mute the microphone."
+
+
+@_register(r"\b(mute|silence)(?!\s+(?:the\s+)?(?:mic|microphone)\b)(?:\s+(the\s+)?(volume|sound|audio))?\b")
 def _h_mute(m: re.Match, text: str) -> str:
     return mute_volume()
 
@@ -566,8 +594,26 @@ def handle_command(text: str) -> Optional[Union[str, PendingAction]]:
 
     Never raises — all exceptions are caught and returned as spoken error strings.
     """
+    command_text = (text or "").strip()
+    # Direct dispatch is for requests phrased as commands. Embedded commands in
+    # reported or quoted speech should go through the intent router instead.
+    command_text = re.sub(
+        r"^(?:(?:hey\s+)?jarvis[,\s:-]+|please\s+|could\s+you\s+|can\s+you\s+|would\s+you\s+|will\s+you\s+)+",
+        "",
+        command_text,
+        flags=re.IGNORECASE,
+    )
+    command_text = re.sub(
+        r"\s+(?:please|now|for me|thanks|thank you)[.!?]*$",
+        "",
+        command_text,
+        flags=re.IGNORECASE,
+    ).strip(" \t\r\n.,!?;")
+    if not command_text:
+        return None
+
     for pattern, handler in _DISPATCH:
-        m = pattern.search(text)
+        m = pattern.match(command_text)
         if m:
             try:
                 result = handler(m, text)
@@ -579,6 +625,11 @@ def handle_command(text: str) -> Optional[Union[str, PendingAction]]:
                 else:
                     print(f"[actions] Executed '{pattern.pattern}' -> {result!r}", flush=True)
                 return result
+            except UnsupportedApplicationError as exc:
+                # Let the LLM router resolve a spoken app alias before giving
+                # up; only known action functions can be called afterward.
+                print(f"[actions] Unresolved application target: {exc}", flush=True)
+                return None
             except RuntimeError as exc:
                 # User-friendly error already composed in the handler.
                 print(f"[actions] Command error: {exc}", flush=True)
@@ -587,3 +638,190 @@ def handle_command(text: str) -> Optional[Union[str, PendingAction]]:
                 print(f"[actions] Unexpected error: {type(exc).__name__}: {exc}", flush=True)
                 return f"I encountered an error trying to do that: {exc}"
     return None
+
+
+def _structured_percent(value: Any, label: str) -> int:
+    """Validate a numeric percentage returned by the LLM router."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeError(f"I couldn't determine the {label} level.")
+    if not math.isfinite(value) or not 0 <= value <= 100:
+        raise RuntimeError(f"The {label} level must be between 0 and 100 percent.")
+    return round(value)
+
+
+def _close_app_process(target: str) -> str:
+    """Close one named Windows process, without shell interpretation."""
+    target = target.strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}", target):
+        raise RuntimeError("I couldn't safely identify that application.")
+
+    lower = target.lower()
+    if lower in {"chrome", "google chrome"}:
+        image_name = "chrome.exe"
+    else:
+        mapped_exe = next(
+            (
+                exe
+                for app, exe in _APP_MAP.items()
+                if app == lower and not exe.lower().startswith("ms-")
+            ),
+            None,
+        )
+        if mapped_exe:
+            image_name = os.path.basename(mapped_exe)
+        else:
+            stem = re.sub(r"\s+", "", target)
+            image_name = stem if stem.lower().endswith(".exe") else f"{stem}.exe"
+
+    result = _run(["taskkill", "/im", image_name])
+    if result.returncode == 0:
+        return f"Closed {target}."
+    detail = (result.stderr or result.stdout).strip()
+    raise RuntimeError(detail or f"Could not close {target}.")
+
+
+def _validated_http_url(value: Any) -> Optional[str]:
+    """Accept only complete HTTP(S) URLs from the structured router."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    url = value.strip()
+    parsed = urlsplit(url)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        raise RuntimeError("I can only open a complete HTTP or HTTPS web address.")
+    return url
+
+
+def handle_structured_command(command: dict[str, Any]) -> Optional[Union[str, PendingAction]]:
+    """Validate and execute one allowlisted action produced by the LLM router.
+
+    This deliberately accepts a small, typed action schema instead of arbitrary
+    shell commands or free-form instructions. Destructive actions still return
+    PendingAction so the caller must obtain verbal confirmation.
+    """
+    if not isinstance(command, dict):
+        return None
+
+    intent = command.get("intent")
+    confidence = command.get("confidence")
+    if (
+        not isinstance(intent, str)
+        or isinstance(confidence, bool)
+        or not isinstance(confidence, (int, float))
+        or not math.isfinite(confidence)
+        or not 0 <= confidence <= 1
+    ):
+        return "I couldn't safely understand that command. Could you say it another way?"
+    if confidence < 0.75:
+        return "I'm not sure I understood that command. Could you rephrase it?"
+
+    target = command.get("target")
+    if target is not None and not isinstance(target, str):
+        return "I couldn't identify the requested target. Could you rephrase it?"
+    target = target.strip() if target else ""
+    direction = command.get("direction")
+    if direction is not None and not isinstance(direction, str):
+        return "I couldn't determine the direction for that command."
+    direction = direction.lower().strip() if direction else ""
+
+    try:
+        if intent == "open_app":
+            if not target:
+                raise RuntimeError("Which application or website should I open?")
+            result: Union[str, PendingAction] = open_app(target)
+        elif intent == "open_website":
+            if not target:
+                raise RuntimeError("Which website should I open?")
+            url = _validated_http_url(target)
+            if url:
+                webbrowser.open(url)
+                result = f"Opening {url}."
+            else:
+                result = open_app(target)
+        elif intent == "open_new_tab":
+            url = _validated_http_url(command.get("url"))
+            if not url and target:
+                known_url = _URL_MAP.get(target.lower())
+                if known_url:
+                    url = known_url
+                else:
+                    raise RuntimeError("I couldn't identify a safe website address.")
+            result = open_chrome_tab(url or "https://www.google.com")
+        elif intent == "close_app":
+            if not target:
+                raise RuntimeError("Which application should I close?")
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}", target):
+                raise RuntimeError("I couldn't safely identify that application.")
+            result = PendingAction(
+                f"Close {target}? Unsaved work in that application may be lost. Say yes to confirm.",
+                lambda target=target: _close_app_process(target),
+            )
+        elif intent == "close_chrome_tabs":
+            result = PendingAction(
+                "Are you sure you want to close all Chrome tabs? Say yes to confirm.",
+                close_chrome_tabs,
+            )
+        elif intent == "close_current_tab":
+            result = PendingAction(
+                "Close the current browser tab? Say yes to confirm.",
+                close_current_tab,
+            )
+        elif intent == "set_volume":
+            result = set_volume(_structured_percent(command.get("value"), "volume"))
+        elif intent == "adjust_volume":
+            if direction not in {"increase", "decrease"}:
+                raise RuntimeError("Should I increase or decrease the volume?")
+            result = change_volume(20 if direction == "increase" else -20)
+        elif intent == "set_brightness":
+            result = set_brightness(_structured_percent(command.get("value"), "brightness"))
+        elif intent == "adjust_brightness":
+            if direction not in {"increase", "decrease"}:
+                raise RuntimeError("Should I increase or decrease the brightness?")
+            result = set_brightness(80 if direction == "increase" else 30)
+        elif intent == "mute":
+            result = mute_volume()
+        elif intent == "unmute":
+            result = unmute_volume()
+        elif intent == "play_pause":
+            result = media_play_pause()
+        elif intent == "stop_media":
+            result = media_stop()
+        elif intent == "next_track":
+            result = media_next()
+        elif intent == "previous_track":
+            result = media_previous()
+        elif intent == "take_screenshot":
+            result = take_screenshot()
+        elif intent == "lock_screen":
+            result = lock_screen()
+        elif intent == "sleep_pc":
+            result = PendingAction(
+                "Put the computer to sleep? Say yes to confirm.", sleep_pc
+            )
+        elif intent == "shutdown_pc":
+            result = PendingAction(
+                "Shut down the computer? This will close open programs. Say yes to confirm.",
+                shutdown_pc,
+            )
+        elif intent == "restart_pc":
+            result = PendingAction(
+                "Restart the computer? Say yes to confirm.", restart_pc
+            )
+        elif intent == "cancel_shutdown":
+            result = cancel_shutdown()
+        else:
+            return "I can't safely perform that action yet."
+    except RuntimeError as exc:
+        print(f"[actions] Structured command error: {exc}", flush=True)
+        return str(exc)
+    except Exception as exc:
+        print(
+            f"[actions] Structured command error: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        return f"I encountered an error trying to do that: {exc}"
+
+    if isinstance(result, PendingAction):
+        print(f"[actions] Confirmation required: {result.confirmation_prompt!r}", flush=True)
+    else:
+        print(f"[actions] LLM intent {intent!r} -> {result!r}", flush=True)
+    return result

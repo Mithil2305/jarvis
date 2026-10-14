@@ -17,3 +17,5 @@ misaki[en]>=0.7
 pycaw>=0.5.1
 comtypes>=1.4
 pyautogui>=0.9.54
+# Telegram remote interface with voice notes
+python-telegram-bot>=21.0
