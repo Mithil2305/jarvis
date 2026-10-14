@@ -491,15 +491,13 @@ async def handle_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await _handle_unauthorized(update)
         return
 
-    try:
-        SHUTDOWN_REQUEST.parent.mkdir(parents=True, exist_ok=True)
-        SHUTDOWN_REQUEST.write_text("shutdown requested via Telegram\n", encoding="utf-8")
-    except OSError as exc:
-        logger.exception("Could not request Jarvis shutdown")
-        await update.message.reply_text(f"Jarvis could not shut down: {exc}")
-        return
-
     await update.message.reply_text("Shutting down Jarvis and its voice, Telegram, and model services.")
+    try:
+        from jarvis_indicator import shutdown_jarvis_system
+        shutdown_jarvis_system(caller_pid=os.getpid())
+    except Exception as exc:
+        logger.exception("Could not stop all Jarvis services: %s", exc)
+
     # run_polling() handles this signal and closes the Telegram application cleanly.
     context.application.stop_running()
 

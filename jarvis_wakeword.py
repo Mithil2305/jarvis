@@ -433,6 +433,11 @@ def _shutdown_services() -> None:
     _stop_process_tree(_TELEGRAM_PROCESS, "Telegram")
     _stop_process_tree(_VOICE_PROCESS, "voice assistant")
     _stop_process_tree(_MODEL_PROCESS, "model server")
+    try:
+        from jarvis_indicator import shutdown_jarvis_system
+        shutdown_jarvis_system(caller_pid=os.getpid())
+    except Exception as exc:
+        logging.warning("shutdown_jarvis_system fallback note: %s", exc)
 
 
 def main() -> int:

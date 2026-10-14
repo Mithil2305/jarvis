@@ -22,3 +22,6 @@ comtypes>=1.4
 pyautogui>=0.9.54
 # Telegram remote interface with voice notes
 python-telegram-bot>=21.0
+# System process management and UI assets
+psutil>=5.9
+pillow>=9.0

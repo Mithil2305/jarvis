@@ -9,6 +9,7 @@ import ctypes
 import math
 import os
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -80,6 +81,73 @@ def ensure_icon_assets() -> None:
         )
     except Exception as exc:
         print(f"[indicator] Icon asset creation note: {exc}", flush=True)
+
+
+def shutdown_jarvis_system(caller_pid: Optional[int] = None) -> dict[str, int]:
+    """Gracefully terminate all active Jarvis services (model server, Telegram bot, wakeword)."""
+    if caller_pid is None:
+        caller_pid = os.getpid()
+
+    report = {"model": 0, "telegram": 0, "wakeword": 0}
+    print("\n[shutdown] Terminating all active Jarvis background services...", flush=True)
+
+    # 1. Terminate llama-server.exe (frees 5GB RAM and GPU VRAM)
+    try:
+        res = subprocess.run(
+            ["taskkill", "/F", "/IM", "llama-server.exe", "/T"],
+            capture_output=True,
+            text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if res.returncode == 0:
+            report["model"] += 1
+            print("[shutdown] Successfully stopped llama-server process tree.", flush=True)
+    except Exception as exc:
+        print(f"[shutdown] Note on llama-server taskkill: {exc}", flush=True)
+
+    # 2. Terminate telegram_jarvis.py and jarvis_wakeword.py processes
+    try:
+        import psutil
+        for p in psutil.process_iter(["pid", "name", "cmdline"]):
+            try:
+                pid = p.info["pid"]
+                if pid == caller_pid:
+                    continue
+                args = p.info.get("cmdline") or []
+                name = (p.info.get("name") or "").lower()
+
+                if "llama-server" in name:
+                    p.kill()
+                    report["model"] += 1
+                elif any(arg.endswith("telegram_jarvis.py") or arg == "telegram_jarvis.py" for arg in args):
+                    print(f"[shutdown] Terminating Telegram bot (PID {pid})...", flush=True)
+                    p.terminate()
+                    try:
+                        p.wait(timeout=1.5)
+                    except psutil.TimeoutExpired:
+                        p.kill()
+                    report["telegram"] += 1
+                elif any(arg.endswith("jarvis_wakeword.py") or arg == "jarvis_wakeword.py" for arg in args):
+                    print(f"[shutdown] Terminating wakeword supervisor (PID {pid})...", flush=True)
+                    p.terminate()
+                    try:
+                        p.wait(timeout=1.5)
+                    except psutil.TimeoutExpired:
+                        p.kill()
+                    report["wakeword"] += 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+    except Exception as exc:
+        print(f"[shutdown] Note on process scan: {exc}", flush=True)
+
+    # 3. Touch shutdown request file for supervisor
+    try:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        SHUTDOWN_REQUEST.write_text("shutdown requested from desktop HUD\n", encoding="utf-8")
+    except OSError:
+        pass
+
+    return report
 
 
 class JarvisIndicator:
@@ -366,15 +434,11 @@ class JarvisIndicator:
         if self._is_shutting_down:
             return
         self._is_shutting_down = True
-        self.set_state("stopping", "Shutting down Jarvis...")
-        print("\n[HUD] Shut Down requested. Initiating clean exit...", flush=True)
+        self.set_state("stopping", "Shutting down all Jarvis services...")
+        print("\n[HUD] Shut Down requested. Terminating model, Telegram bot, and voice pipeline...", flush=True)
 
-        # 1. Write the supervisor shutdown file so wakeword launcher cleans up all processes
-        try:
-            LOGS_DIR.mkdir(parents=True, exist_ok=True)
-            SHUTDOWN_REQUEST.write_text("shutdown requested from desktop HUD\n", encoding="utf-8")
-        except OSError:
-            pass
+        # 1. Terminate all background services (model server, Telegram bot, etc.)
+        shutdown_jarvis_system(caller_pid=os.getpid())
 
         # 2. Trigger external callback
         if self.on_shutdown:

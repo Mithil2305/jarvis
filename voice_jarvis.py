@@ -440,6 +440,8 @@ def _voice_assistant_loop(indicator: Optional[JarvisIndicator] = None) -> None:
                     indicator.set_state("stopping", "Shutting down...")
                 speak("Goodbye.")
                 _SHUTDOWN_EVENT.set()
+                from jarvis_indicator import shutdown_jarvis_system
+                shutdown_jarvis_system(caller_pid=os.getpid())
                 if indicator:
                     indicator.request_shutdown()
                 break
